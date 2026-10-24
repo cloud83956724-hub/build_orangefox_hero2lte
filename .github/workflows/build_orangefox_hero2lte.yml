@@ -1,4 +1,4 @@
-name: Build OrangeFox hero2lte (A-Z + AI auto-fix v4)
+name: Build OrangeFox hero2lte (A-Z + AI auto-fix v5)
 
 on:
   workflow_dispatch:
@@ -23,7 +23,6 @@ jobs:
       DEVICE_TREE_URL: "https://github.com/OrangeFoxRecovery/device_samsung_hero2lte.git"
       DEVICE_TREE_BRANCH: "fox_11.0"
       AI_ENDPOINT: "https://models.inference.ai.azure.com/chat/completions"
-      AI_MODEL: "gpt-4o-mini"
       MAX_ATTEMPTS: "3"
       DEP_HERO_COMMON_URL: ""
       DEP_HERO_COMMON_BRANCH: "fox_11.0"
@@ -86,7 +85,9 @@ jobs:
           set +e
           mkdir -p "$WORKDIR/artifacts"
 
-          # ---------- Build script (chạy trong container) ----------
+          # ============================================================
+          # Container build script
+          # ============================================================
           cat > /tmp/of_build.sh <<'BUILDEOF'
           #!/bin/bash
           set +e
@@ -96,131 +97,138 @@ jobs:
           ART_DIR="$WORKDIR/artifacts"
           LOG="$WORKDIR/build.log"
           SENTINEL="$WORKDIR/.build_done"
+          AI_FIX="$WORKDIR/.ai_fix.sh"
           FAILED=()
           mkdir -p "$WORKDIR" "$ART_DIR" "/root/.ccache"
           : > "$LOG"
           log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
+          # Áp dụng AI fix từ attempt trước (nếu có)
+          if [ -f "$AI_FIX" ]; then
+              log ">>> Sourcing AI fix from previous attempt:"
+              tee -a "$LOG" < "$AI_FIX" >&2
+              # shellcheck disable=SC1090
+              source "$AI_FIX" 2>&1 | tee -a "$LOG" >&2
+              log ">>> AI fix sourced (exit=$?)"
+          fi
+
           retry_step() {
-            local name="$1"; shift
-            log "════════ STEP: $name ════════"
-            "$@" 2>&1 | stdbuf -oL -eL tee -a "$LOG" >&2
-            local rc=${PIPESTATUS[0]}
-            if [ "$rc" -eq 0 ]; then log "[OK] $name"; return 0; fi
-            log "[RETRY] $name rc=$rc"
-            sleep 5
-            "$@" 2>&1 | stdbuf -oL -eL tee -a "$LOG" >&2
-            rc=${PIPESTATUS[0]}
-            if [ "$rc" -eq 0 ]; then log "[OK] $name (retry)"; return 0; fi
-            log "[FAIL] $name rc=$rc -> CONTINUE"
-            FAILED+=("$name"); return 0
+              local name="$1"; shift
+              log "════════ STEP: $name ════════"
+              "$@" 2>&1 | stdbuf -oL -eL tee -a "$LOG" >&2
+              local rc=${PIPESTATUS[0]}
+              if [ "$rc" -eq 0 ]; then log "[OK] $name"; return 0; fi
+              log "[RETRY] $name rc=$rc"
+              sleep 5
+              "$@" 2>&1 | stdbuf -oL -eL tee -a "$LOG" >&2
+              rc=${PIPESTATUS[0]}
+              if [ "$rc" -eq 0 ]; then log "[OK] $name (retry)"; return 0; fi
+              log "[FAIL] $name rc=$rc -> CONTINUE"
+              FAILED+=("$name")
+              return 0
           }
 
           s00_env() {
-            uname -a; head -2 /etc/os-release; nproc; free -h; df -h /
-            for t in git curl gcc make ccache python3 zip unzip java repo; do
-              command -v $t || echo "MISSING $t"
-            done
+              uname -a; head -2 /etc/os-release; nproc; free -h; df -h /
+              for t in git curl gcc make ccache python3 zip unzip java repo; do
+                  command -v $t || echo "MISSING $t"
+              done
           }
 
           s01_ccache() {
-            export CCACHE_DIR="/root/.ccache"
-            ccache -M "$CCACHE_MAX"; ccache -z; ccache -s
+              export CCACHE_DIR="/root/.ccache"
+              ccache -M "$CCACHE_MAX"; ccache -z; ccache -s
           }
 
           s02_repo_tool() {
-            mkdir -p /root/.bin
-            curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /root/.bin/repo
-            chmod +x /root/.bin/repo
-            export PATH="/root/.bin:$PATH"
-            repo --version
+              mkdir -p /root/.bin
+              curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /root/.bin/repo
+              chmod +x /root/.bin/repo
+              export PATH="/root/.bin:$PATH"
+              repo --version
           }
 
-          # Bỏ wrapper orangefox_sync.sh — gọi repo init/sync TRỰC TIẾP để thấy lỗi thật
           s03_sync_fox() {
-            export PATH="/root/.bin:$PATH"
-            export GIT_SSL_NO_VERIFY=false
-            cd "$WORKDIR" || return 1
-
-            if [ ! -d "$FOX_PATH/.repo" ]; then
-              mkdir -p "$FOX_PATH"
-              cd "$FOX_PATH" || return 1
-              echo ">>> repo init..."
-              set -x
-              repo init --depth=1 -u https://gitlab.com/OrangeFox/Manifest.git -b fox_11.0 2>&1
-              local rc=$?
-              set +x
-              [ $rc -eq 0 ] || { echo "!!! repo init failed rc=$rc"; return 1; }
-              echo ">>> repo sync (OrangeFox core tree, KHÔNG gồm device)..."
-              repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags \
-                --current-branch 2>&1
-              return $?
-            else
-              cd "$FOX_PATH" || return 1
-              repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags 2>&1
-              return $?
-            fi
+              export PATH="/root/.bin:$PATH"
+              cd "$WORKDIR" || return 1
+              if [ ! -d "$FOX_PATH/.repo" ]; then
+                  mkdir -p "$FOX_PATH"
+                  cd "$FOX_PATH" || return 1
+                  echo ">>> repo init..."
+                  set -x
+                  repo init --depth=1 -u https://gitlab.com/OrangeFox/Manifest.git -b fox_11.0 2>&1
+                  local rc=$?
+                  set +x
+                  [ $rc -eq 0 ] || { echo "!!! repo init failed rc=$rc"; return 1; }
+                  echo ">>> repo sync..."
+                  repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags --current-branch 2>&1
+                  return $?
+              else
+                  cd "$FOX_PATH" || return 1
+                  repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags 2>&1
+                  return $?
+              fi
           }
 
           s04_clone_dt() {
-            mkdir -p "$FOX_PATH/device/samsung"
-            rm -rf "$FOX_PATH/device/samsung/$DEVICE"
-            git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" \
-              "$FOX_PATH/device/samsung/$DEVICE"
+              mkdir -p "$FOX_PATH/device/samsung"
+              rm -rf "$FOX_PATH/device/samsung/$DEVICE"
+              git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" \
+                  "$FOX_PATH/device/samsung/$DEVICE"
           }
 
           s05_clone_deps() {
-            cd "$FOX_PATH" || return 1
-            local fail=0
-            if [ -n "$DEP_HERO_COMMON_URL" ] && [ ! -d device/samsung/hero-common ]; then
-              git clone --depth=1 -b "$DEP_HERO_COMMON_BRANCH" \
-                "$DEP_HERO_COMMON_URL" device/samsung/hero-common || fail=1
-            fi
-            if [ -n "$DEP_UNIVERSAL8890_URL" ] && [ ! -d kernel/samsung/universal8890 ]; then
-              mkdir -p kernel/samsung
-              git clone --depth=1 -b "$DEP_UNIVERSAL8890_BRANCH" \
-                "$DEP_UNIVERSAL8890_URL" kernel/samsung/universal8890 || fail=1
-            fi
-            if [ -n "$DEP_HW_SAMSUNG_URL" ] && [ ! -d hardware/samsung ]; then
-              mkdir -p hardware
-              git clone --depth=1 -b "$DEP_HW_SAMSUNG_BRANCH" \
-                "$DEP_HW_SAMSUNG_URL" hardware/samsung || fail=1
-            fi
-            return $fail
+              cd "$FOX_PATH" || return 1
+              local fail=0
+              if [ -n "$DEP_HERO_COMMON_URL" ] && [ ! -d device/samsung/hero-common ]; then
+                  git clone --depth=1 -b "$DEP_HERO_COMMON_BRANCH" \
+                      "$DEP_HERO_COMMON_URL" device/samsung/hero-common || fail=1
+              fi
+              if [ -n "$DEP_UNIVERSAL8890_URL" ] && [ ! -d kernel/samsung/universal8890 ]; then
+                  mkdir -p kernel/samsung
+                  git clone --depth=1 -b "$DEP_UNIVERSAL8890_BRANCH" \
+                      "$DEP_UNIVERSAL8890_URL" kernel/samsung/universal8890 || fail=1
+              fi
+              if [ -n "$DEP_HW_SAMSUNG_URL" ] && [ ! -d hardware/samsung ]; then
+                  mkdir -p hardware
+                  git clone --depth=1 -b "$DEP_HW_SAMSUNG_BRANCH" \
+                      "$DEP_HW_SAMSUNG_URL" hardware/samsung || fail=1
+              fi
+              return $fail
           }
 
           s06_build() {
-            cd "$FOX_PATH" || return 1
-            [ -f build/envsetup.sh ] || { echo "!!! No build/envsetup.sh (sync chưa hoàn tất)"; return 1; }
-            export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1
-            export CCACHE_DIR="/root/.ccache" CCACHE_COMPRESS=1 CCACHE_MAXSIZE="$CCACHE_MAX"
-            source build/envsetup.sh || return 1
-            lunch omni_${DEVICE}-eng || lunch fox_${DEVICE}-eng || return 1
-            mka recoveryimage -j"$JOBS"
+              cd "$FOX_PATH" || return 1
+              [ -f build/envsetup.sh ] || { echo "!!! No build/envsetup.sh (sync chưa hoàn tất)"; return 1; }
+              export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1
+              export CCACHE_DIR="/root/.ccache" CCACHE_COMPRESS=1 CCACHE_MAXSIZE="$CCACHE_MAX"
+              source build/envsetup.sh || return 1
+              lunch omni_${DEVICE}-eng || lunch fox_${DEVICE}-eng || return 1
+              mka recoveryimage -j"$JOBS"
           }
 
           s07_collect() {
-            local out="$FOX_PATH/out/target/product/$DEVICE"
-            [ -d "$out" ] || { echo "out missing: $out"; return 1; }
-            find "$out" -maxdepth 1 -type f \
-              \( -name 'recovery.img' -o -name 'OrangeFox*.zip' \) \
-              -exec cp -v {} "$ART_DIR"/ \; || true
-            ls -la "$ART_DIR"
-            [ -f "$ART_DIR/recovery.img" ] || ls "$ART_DIR"/OrangeFox*.zip >/dev/null 2>&1
+              local out="$FOX_PATH/out/target/product/$DEVICE"
+              [ -d "$out" ] || { echo "out missing: $out"; return 1; }
+              find "$out" -maxdepth 1 -type f \
+                  \( -name 'recovery.img' -o -name 'OrangeFox*.zip' \) \
+                  -exec cp -v {} "$ART_DIR"/ \; || true
+              ls -la "$ART_DIR"
+              [ -f "$ART_DIR/recovery.img" ] || ls "$ART_DIR"/OrangeFox*.zip >/dev/null 2>&1
           }
 
           s08_package() {
-            cd "$ART_DIR" || return 1
-            rm -rf _pkg
-            local ofox_zip
-            ofox_zip=$(ls -1 OrangeFox*.zip 2>/dev/null | grep -vxF "$ZIP_NAME" | head -n1 || true)
-            if [ -n "$ofox_zip" ] && [ -f "$ofox_zip" ]; then
-              cp -f "$ofox_zip" "$ZIP_NAME"; return 0
-            fi
-            [ -f recovery.img ] || { echo "no recovery.img"; return 1; }
-            mkdir -p _pkg/META-INF/com/google/android
-            cp recovery.img _pkg/recovery.img
-            cat > _pkg/META-INF/com/google/android/update-binary <<'EOS'
+              cd "$ART_DIR" || return 1
+              rm -rf _pkg
+              local ofox_zip
+              ofox_zip=$(ls -1 OrangeFox*.zip 2>/dev/null | grep -vxF "$ZIP_NAME" | head -n1 || true)
+              if [ -n "$ofox_zip" ] && [ -f "$ofox_zip" ]; then
+                  cp -f "$ofox_zip" "$ZIP_NAME"; return 0
+              fi
+              [ -f recovery.img ] || { echo "no recovery.img"; return 1; }
+              mkdir -p _pkg/META-INF/com/google/android
+              cp recovery.img _pkg/recovery.img
+              cat > _pkg/META-INF/com/google/android/update-binary <<'EOS'
           #!/sbin/sh
           OUTFD=$2; ZIPFILE=$3
           ui_print() { echo "ui_print $1" >&$OUTFD; echo "ui_print" >&$OUTFD; }
@@ -234,11 +242,13 @@ jobs:
           sync
           ui_print "Flash complete"
           EOS
-            chmod +x _pkg/META-INF/com/google/android/update-binary
-            printf 'ui_print("OrangeFox recovery flash");\n' > _pkg/META-INF/com/google/android/updater-script
-            rm -f "$ZIP_NAME"
-            ( cd _pkg && zip -r "../$ZIP_NAME" . >/dev/null )
-            local rc=$?; rm -rf _pkg; return $rc
+              chmod +x _pkg/META-INF/com/google/android/update-binary
+              printf 'ui_print("OrangeFox recovery flash");\n' > _pkg/META-INF/com/google/android/updater-script
+              rm -f "$ZIP_NAME"
+              ( cd _pkg && zip -r "../$ZIP_NAME" . >/dev/null )
+              local rc=$?
+              rm -rf _pkg
+              return $rc
           }
 
           retry_step "00_env"        s00_env
@@ -252,157 +262,162 @@ jobs:
           retry_step "08_package"    s08_package
 
           log "════════ SUMMARY ════════"
-          if [ "${#FAILED[@]}" -eq 0 ]; then log "All steps OK"
-          else for s in "${FAILED[@]}"; do log "  - $s"; done; fi
-          if [ -f "$ART_DIR/$ZIP_NAME" ]; then
-            log "ARTIFACT OK: $ART_DIR/$ZIP_NAME"
-            touch "$SENTINEL"
+          if [ "${#FAILED[@]}" -eq 0 ]; then
+              log "All steps OK"
           else
-            log "NO ARTIFACT produced"
+              for s in "${FAILED[@]}"; do log "  - $s"; done
+          fi
+          if [ -f "$ART_DIR/$ZIP_NAME" ]; then
+              log "ARTIFACT OK: $ART_DIR/$ZIP_NAME"
+              touch "$SENTINEL"
+          else
+              log "NO ARTIFACT produced"
           fi
           BUILDEOF
 
           chmod +x /tmp/of_build.sh
           bash -n /tmp/of_build.sh || { echo "SYNTAX ERROR in build script"; exit 1; }
 
-          # ---------- AI helper ----------
+          # ============================================================
+          # AI system prompt — heredoc, MỌI dòng ở đúng 10 spaces
+          # ============================================================
+          cat > /tmp/ai_system_raw.txt <<'SYSEOF'
+          You are an expert at fixing Android OrangeFox/TWRP build failures.
+          Output ONLY a bash script (no markdown fences, no explanation).
+          The script runs inside ubuntu:20.04 as root, with git, curl, repo at /root/.bin/repo.
+          Constraints:
+          - Whitelisted commands ONLY: apt-get git curl wget repo mkdir rm cp mv ln chmod export source cd echo sed tee tar unzip zip find grep awk head tail cat true false if then else elif fi for do done while case esac
+          - Max 40 lines.
+          - If you cannot determine a fix, output one line: # NO FIX
+          - NEVER use: eval, sh -c, bash -c, base64, xargs, pipe into sh/bash, wget -O -, curl -o - piped anywhere, su, sudo, systemctl, mount, umount, dd, chown.
+          - Common fixes:
+            * repo: command not found -> export PATH=/root/.bin:$PATH
+            * git SSL verify fails -> git config --global http.sslVerify false
+            * repo init manifest URL 404 -> echo "manifest URL broken, check OrangeFox gitlab" and exit 0
+            * out of disk -> apt-get clean; rm -rf /tmp/*; rm -rf /root/.cache
+            * missing build/envsetup.sh -> cd /workspace/foxbuild/11.0 && repo sync -j1 --force-sync
+            * device tree missing deps -> note in echo which DEP_* envs to set
+          SYSEOF
+          sed -e 's/^          //' -e '/^$/d' /tmp/ai_system_raw.txt > /tmp/ai_system.txt
+          echo "─── AI system prompt (first 20 lines) ───"
+          head -20 /tmp/ai_system.txt
+
+          # ============================================================
+          # AI helper
+          # ============================================================
           ai_fix() {
-            local log_file="$WORKDIR/build.log"
-            [ -f "$log_file" ] || { echo "No log for AI"; return 1; }
+              local log_file="$WORKDIR/build.log"
+              [ -f "$log_file" ] || { echo "No log"; return 1; }
+              tail -n 3000 "$log_file" | head -c 100000 > /tmp/log_snip.txt
+              echo "Log snippet: $(wc -c < /tmp/log_snip.txt) bytes"
 
-            # Lấy 3000 dòng cuối, sanitize ký tự có thể injection
-            tail -n 3000 "$log_file" > /tmp/log_tail.txt
-            head -c 100000 /tmp/log_tail.txt > /tmp/log_snip.txt
+              jq -n \
+                  --rawfile sys /tmp/ai_system.txt \
+                  --rawfile log /tmp/log_snip.txt \
+                  '{
+                      model: "gpt-4o-mini",
+                      messages: [
+                          {role:"system", content:$sys},
+                          {role:"user", content:("BUILD LOG:\n" + $log + "\n\nFix script:")}
+                      ],
+                      max_tokens: 1500,
+                      temperature: 0.1
+                  }' > /tmp/ai_req.json
 
-            local sys='You are an expert at fixing Android recovery (OrangeFox/TWRP) build failures.
-Output ONLY a bash script (no markdown fences, no explanation).
-The script runs inside ubuntu:20.04 as root, inside container that has git, curl, repo at /root/.bin/repo.
-Constraints:
-- Whitelisted commands ONLY: apt-get git curl wget repo mkdir rm cp mv ln chmod export source cd echo sed tee tar unzip zip find grep awk head tail cat true false if then else fi for do done.
-- Max 40 lines.
-- If you cannot determine a fix, output EXACTLY: # NO FIX
-- Common fixes:
-  * repo: command not found → export PATH=$PATH:/root/.bin
-  * git clone SSL → git config --global http.sslVerify false
-  * repo init fails with manifest URL → echo URL, exit 1 (so human sees)
-  * out of disk → apt-get clean; rm -rf /tmp/*
-  * missing build/envsetup.sh → the sync step did not finish; re-run repo sync -j1
-- NEVER use eval, sh -c "$(...)", pipe to sh, base64 -d, or any command outside whitelist.'
+              echo "Request size: $(wc -c < /tmp/ai_req.json) bytes"
+              local resp
+              resp=$(curl -sS -X POST "$AI_ENDPOINT" \
+                  -H "Authorization: Bearer $GITHUB_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -d @/tmp/ai_req.json 2>&1)
+              echo "$resp" > /tmp/ai_resp.json
 
-            jq -n --arg sys "$sys" --rawfile log /tmp/log_snip.txt '{
-              model: "gpt-4o-mini",
-              messages: [
-                {role:"system", content:$sys},
-                {role:"user", content:("BUILD LOG:\n" + $log + "\n\nFix script:")}
-              ],
-              max_tokens: 1500,
-              temperature: 0.1
-            }' > /tmp/ai_req.json
+              local content
+              content=$(jq -r '.choices[0].message.content // empty' /tmp/ai_resp.json 2>/dev/null)
+              if [ -z "$content" ]; then
+                  echo "AI call failed or empty response:"
+                  head -c 500 /tmp/ai_resp.json
+                  echo
+                  return 1
+              fi
 
-            echo "─── AI request size: $(wc -c < /tmp/ai_req.json) bytes ───"
-            local resp
-            resp=$(curl -sS -X POST "$AI_ENDPOINT" \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d @/tmp/ai_req.json 2>&1)
+              printf '%s\n' "$content" | sed -e 's/^```[a-zA-Z]*$//' -e 's/^```$//' > /tmp/ai_fix.sh
+              echo "─── AI suggested fix ───"
+              cat /tmp/ai_fix.sh
+              echo "────────────────────────"
 
-            local content
-            content=$(echo "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
-            if [ -z "$content" ]; then
-              echo "AI call failed:"
-              echo "$resp" | head -c 400
-              echo
-              return 1
-            fi
+              local bad=0 line_no=0 line trimmed
+              while IFS= read -r line; do
+                  line_no=$((line_no + 1))
+                  trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
+                  [ -z "$trimmed" ] && continue
+                  case "$trimmed" in
+                      \#*) continue ;;
+                      [A-Za-z_][A-Za-z0-9_]*=*) continue ;;
+                      if\ *|then|else|elif\ *|fi|for\ *|do|done|while\ *|case\ *|esac) continue ;;
+                      apt-get*|git*|curl*|wget*|repo*|mkdir*|rm*|cp*|mv*|ln*|chmod*|export*|source*|cd*|echo*|sed*|tee*|tar*|unzip*|zip*|find*|grep*|awk*|head*|tail*|cat*|true|false) continue ;;
+                  esac
+                  echo "✗ Line $line_no not whitelisted: $trimmed"
+                  bad=1
+              done < /tmp/ai_fix.sh
 
-            # Bỏ markdown fences
-            echo "$content" | sed -e 's/^```[a-zA-Z]*$//' -e 's/^```$//' > /tmp/ai_fix.sh
-            echo "─── AI suggested fix ───"
-            cat /tmp/ai_fix.sh
-            echo "────────────────────────"
-
-            # Validate whitelist
-            local bad=0 line_no=0 line trimmed
-            while IFS= read -r line; do
-              line_no=$((line_no + 1))
-              trimmed=$(echo "$line" | sed 's/^[[:space:]]*//')
-              [ -z "$trimmed" ] && continue
-              [[ "$trimmed" =~ ^# ]] && continue
-              [[ "$trimmed" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
-              [[ "$trimmed" =~ ^(if|then|else|elif|fi|for|do|done|while|case|esac|function|\{|\}) ]] && continue
-              [[ "$trimmed" =~ ^(apt-get|git|curl|wget|repo|mkdir|rm|cp|mv|ln|chmod|export|source|cd|echo|sed|tee|tar|unzip|zip|find|grep|awk|head|tail|cat|true|false)([[:space:]]|$) ]] && continue
-              echo "✗ Line $line_no not whitelisted: $trimmed"
-              bad=1
-            done < /tmp/ai_fix.sh
-
-            if [ $bad -ne 0 ]; then
-              echo "✗ AI fix rejected (whitelist violation)"
-              return 1
-            fi
-            if grep -qxF '# NO FIX' /tmp/ai_fix.sh; then
-              echo "AI: NO FIX available"
-              return 1
-            fi
-            bash -n /tmp/ai_fix.sh || { echo "✗ AI script syntax error"; return 1; }
-            return 0
+              if [ $bad -ne 0 ]; then echo "✗ AI fix rejected"; return 1; fi
+              if grep -qxF '# NO FIX' /tmp/ai_fix.sh; then echo "AI: NO FIX"; return 1; fi
+              bash -n /tmp/ai_fix.sh || { echo "✗ AI script syntax error"; return 1; }
+              echo "✓ AI fix validated"
+              return 0
           }
 
-          # ---------- MAIN LOOP ----------
+          # ============================================================
+          # MAIN LOOP
+          # ============================================================
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-            echo "═══════════════════════════════════════════"
-            echo "  ATTEMPT $attempt / $MAX_ATTEMPTS"
-            echo "═══════════════════════════════════════════"
+              echo "═══════════════════════════════════════════"
+              echo "  ATTEMPT $attempt / $MAX_ATTEMPTS"
+              echo "═══════════════════════════════════════════"
 
-            rm -f "$WORKDIR/.build_done"
-            : > "$WORKDIR/build.log"
+              rm -f "$WORKDIR/.build_done"
+              : > "$WORKDIR/build.log"
 
-            docker run --rm \
-              -v "${{ github.workspace }}:/workspace" \
-              -v "$HOME/.ccache:/root/.ccache" \
-              -v "/tmp/of_build.sh:/of_build.sh:ro" \
-              -w /workspace \
-              -e WORKDIR="/workspace/foxbuild" \
-              -e FOX_BRANCH="$FOX_BRANCH" -e JOBS="$JOBS" \
-              -e CCACHE_MAX="$CCACHE_MAX" -e ZIP_NAME="$ZIP_NAME" \
-              -e DEVICE_TREE_URL="$DEVICE_TREE_URL" \
-              -e DEVICE_TREE_BRANCH="$DEVICE_TREE_BRANCH" \
-              -e DEP_HERO_COMMON_URL="$DEP_HERO_COMMON_URL" \
-              -e DEP_HERO_COMMON_BRANCH="$DEP_HERO_COMMON_BRANCH" \
-              -e DEP_UNIVERSAL8890_URL="$DEP_UNIVERSAL8890_URL" \
-              -e DEP_UNIVERSAL8890_BRANCH="$DEP_UNIVERSAL8890_BRANCH" \
-              -e DEP_HW_SAMSUNG_URL="$DEP_HW_SAMSUNG_URL" \
-              -e DEP_HW_SAMSUNG_BRANCH="$DEP_HW_SAMSUNG_BRANCH" \
-              foxbuilder:hero2lte bash /of_build.sh
-            echo "─── docker exit=$? ───"
-
-            if [ -f "$WORKDIR/artifacts/$ZIP_NAME" ]; then
-              echo "✓ BUILD SUCCESS on attempt $attempt"
-              exit 0
-            fi
-
-            if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
-              echo "✗ All $MAX_ATTEMPTS attempts failed"
-              break
-            fi
-
-            echo "─── Asking AI to diagnose + fix ───"
-            if ai_fix; then
-              echo "─── Applying AI fix in container ───"
               docker run --rm \
-                -v "${{ github.workspace }}:/workspace" \
-                -v "/tmp/ai_fix.sh:/ai_fix.sh:ro" \
-                -w /workspace \
-                -e WORKDIR="/workspace/foxbuild" \
-                -e FOX_BRANCH="$FOX_BRANCH" \
-                foxbuilder:hero2lte bash /ai_fix.sh \
-                && echo "AI fix applied OK" \
-                || echo "AI fix returned non-zero (continuing)"
-            else
-              echo "AI could not suggest a safe fix → next attempt will retry as-is"
-            fi
+                  -v "${{ github.workspace }}:/workspace" \
+                  -v "$HOME/.ccache:/root/.ccache" \
+                  -v "/tmp/of_build.sh:/of_build.sh:ro" \
+                  -w /workspace \
+                  -e WORKDIR="/workspace/foxbuild" \
+                  -e FOX_BRANCH="$FOX_BRANCH" -e JOBS="$JOBS" \
+                  -e CCACHE_MAX="$CCACHE_MAX" -e ZIP_NAME="$ZIP_NAME" \
+                  -e DEVICE_TREE_URL="$DEVICE_TREE_URL" \
+                  -e DEVICE_TREE_BRANCH="$DEVICE_TREE_BRANCH" \
+                  -e DEP_HERO_COMMON_URL="$DEP_HERO_COMMON_URL" \
+                  -e DEP_HERO_COMMON_BRANCH="$DEP_HERO_COMMON_BRANCH" \
+                  -e DEP_UNIVERSAL8890_URL="$DEP_UNIVERSAL8890_URL" \
+                  -e DEP_UNIVERSAL8890_BRANCH="$DEP_UNIVERSAL8890_BRANCH" \
+                  -e DEP_HW_SAMSUNG_URL="$DEP_HW_SAMSUNG_URL" \
+                  -e DEP_HW_SAMSUNG_BRANCH="$DEP_HW_SAMSUNG_BRANCH" \
+                  foxbuilder:hero2lte bash /of_build.sh
+              echo "─── docker exit=$? ───"
 
-            echo "─── Retrying in 5s ───"
-            sleep 5
+              if [ -f "$WORKDIR/artifacts/$ZIP_NAME" ]; then
+                  echo "✓ BUILD SUCCESS on attempt $attempt"
+                  exit 0
+              fi
+
+              if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
+                  echo "✗ All $MAX_ATTEMPTS attempts failed"
+                  break
+              fi
+
+              echo "─── Asking AI to diagnose + fix ───"
+              if ai_fix; then
+                  # Lưu fix để attempt sau source (persistence)
+                  cp /tmp/ai_fix.sh "$WORKDIR/.ai_fix.sh"
+                  echo "─── AI fix saved → sẽ được source ở attempt $((attempt+1)) ───"
+              else
+                  echo "AI không đề xuất fix an toàn → attempt sau chạy lại y nguyên"
+              fi
+              echo "─── Retrying in 5s ───"
+              sleep 5
           done
 
           echo "════════ FINAL ARTIFACT CHECK ════════"
@@ -417,10 +432,12 @@ Constraints:
           path: ${{ env.WORKDIR }}/artifacts/*.zip
           if-no-files-found: warn
 
-      - name: Upload build.log
+      - name: Upload build.log + AI fix trace
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: ${{ env.WORKDIR }}/build.log
+          name: build-log-and-ai-fix
+          path: |
+            ${{ env.WORKDIR }}/build.log
+            ${{ env.WORKDIR }}/.ai_fix.sh
           if-no-files-found: warn
