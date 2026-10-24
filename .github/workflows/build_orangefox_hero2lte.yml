@@ -1,4 +1,4 @@
-name: Build OrangeFox hero2lte (A-Z + AI auto-fix v6)
+name: Build OrangeFox hero2lte (AI-everywhere v7)
 
 on:
   workflow_dispatch:
@@ -21,9 +21,11 @@ jobs:
       CCACHE_MAX: "20G"
       ZIP_NAME: "OrangeFox-hero2lte-TWRP.zip"
       DEVICE_TREE_URL: "https://github.com/OrangeFoxRecovery/device_samsung_hero2lte.git"
-      DEVICE_TREE_BRANCH: "fox_11.0"
+      DEVICE_TREE_BRANCH_PRIMARY: "fox_11.0"
+      DEVICE_TREE_BRANCH_ALT1: "fox_9.0"
+      DEVICE_TREE_BRANCH_ALT2: "main"
       AI_ENDPOINT: "https://models.inference.ai.azure.com/chat/completions"
-      MAX_ATTEMPTS: "3"
+      MAX_SECONDS: "19800"
       DEP_HERO_COMMON_URL: ""
       DEP_HERO_COMMON_BRANCH: "fox_11.0"
       DEP_UNIVERSAL8890_URL: ""
@@ -52,77 +54,34 @@ jobs:
           sudo swapon /swapfile
           free -h
 
-      - name: Build builder image (Debian 11)
+      - name: Bootstrap Dockerfile + build script (persist in WORKDIR)
         run: |
-          cat > /tmp/Dockerfile <<'DOCKEREOF'
-          FROM debian:bullseye
+          set -e
+          mkdir -p "$WORKDIR/artifacts" "$WORKDIR/ai"
+
+          cat > "$WORKDIR/Dockerfile" <<'DOCKEREOF'
+          FROM ubuntu:22.04
           ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C
           SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-          # multilib cho Android (32-bit)
           RUN dpkg --add-architecture i386
-
-          # apt update — KHÔNG pipe qua tail, để exit code thật lộ ra
           RUN apt-get update -y
-
-          # Xác nhận package list có dữ liệu thật
-          RUN apt-cache policy git gcc make curl python3 2>/dev/null | grep -E 'Candidate|Installed' | head -10 \
-              || (echo "!!! APT LISTS EMPTY" && exit 1)
-
-          # Cài theo nhóm nhỏ, mỗi nhóm fail không giết cả list
-          RUN set -x; ok=1; \
-              for grp in \
-                  "ca-certificates" \
-                  "git" \
-                  "curl wget" \
-                  "zip unzip tar xxd" \
-                  "build-essential make" \
-                  "flex bison gperf" \
-                  "python3 python-is-python3" \
-                  "ccache rsync procps file" \
-                  "libssl-dev" \
-                  "openjdk-11-jdk-headless" \
-                  "zlib1g-dev" \
-                  "gcc-multilib g++-multilib libc6-dev-i386" \
-                  "libncurses-dev lib32ncurses-dev" \
-                  "lib32z1-dev lib32readline-dev" \
-                  "lzop libxml2-utils xsltproc fontconfig" \
-                  "libgl1-mesa-dev libx11-dev" \
-              ; do \
-                  echo "════ group: $grp"; \
-                  if apt-get install -y --no-install-recommends -o Acquire::Retries=5 $grp 2>&1 | tail -8; then \
-                      echo "OK group: $grp"; \
-                  else \
-                      echo "WARN group failed (skipping): $grp"; ok=0; \
-                  fi; \
-              done; \
-              echo "=== install done (ok=$ok) ==="
-
-          # Hard requirement — phải có đủ thì mới build được
-          RUN for t in git curl gcc g++ make ccache python3 zip unzip java; do \
-                  command -v $t >/dev/null || { echo "MISSING: $t"; exit 1; }; \
-                  echo "OK $t -> $(command -v $t)"; \
+          RUN apt-get install -y --no-install-recommends \
+                ca-certificates git curl wget zip unzip tar \
+                build-essential make flex bison gperf \
+                python3 python-is-python3 \
+                ccache rsync procps file xxd \
+                libssl-dev openjdk-11-jdk-headless \
+                zlib1g-dev gcc-multilib g++-multilib \
+                libncurses-dev lib32ncurses-dev lib32z1-dev lib32readline-dev \
+                lzop libxml2-utils xsltproc fontconfig \
+                libgl1-mesa-dev libx11-dev
+          RUN for t in git curl gcc g++ make ccache python3 zip unzip java file; do \
+                command -v $t >/dev/null || { echo "MISSING $t"; exit 1; }; \
               done
-
-          # python3 -> python symlink nếu cần (repo tool dùng python)
-          RUN [ -e /usr/local/bin/python ] || ln -sf /usr/bin/python3 /usr/local/bin/python; python --version
-
           WORKDIR /workspace
           DOCKEREOF
 
-          cat /tmp/Dockerfile
-          echo "═══ docker build (apt errors sẽ hiện ngay) ═══"
-          docker build --progress=plain -t foxbuilder:hero2lte /tmp/
-
-      - name: Build loop with AI auto-fix
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set +e
-          mkdir -p "$WORKDIR/artifacts"
-
-          # ===================== container build script =====================
-          cat > /tmp/of_build.sh <<'BUILDEOF'
+          cat > "$WORKDIR/of_build.sh" <<'BUILDEOF'
           #!/bin/bash
           set +e
           export LC_ALL=C
@@ -131,19 +90,18 @@ jobs:
           ART_DIR="$WORKDIR/artifacts"
           LOG="$WORKDIR/build.log"
           SENTINEL="$WORKDIR/.build_done"
-          AI_FIX="$WORKDIR/.ai_fix.sh"
+          AI_FIX="$WORKDIR/ai/ai_fix.sh"
           FAILED=()
           mkdir -p "$WORKDIR" "$ART_DIR" "/root/.ccache"
           : > "$LOG"
           log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
-          # Load AI fix từ attempt trước (nếu có) — chạy TRƯỚC mọi bước
           if [ -f "$AI_FIX" ]; then
               log ">>> Sourcing AI fix from previous attempt:"
               tee -a "$LOG" < "$AI_FIX" >&2
               # shellcheck disable=SC1090
               source "$AI_FIX" 2>&1 | tee -a "$LOG" >&2
-              log ">>> AI fix sourced"
+              log ">>> AI fix sourced (rc=$?)"
           fi
 
           retry_step() {
@@ -152,8 +110,7 @@ jobs:
               "$@" 2>&1 | stdbuf -oL -eL tee -a "$LOG" >&2
               local rc=${PIPESTATUS[0]}
               if [ "$rc" -eq 0 ]; then log "[OK] $name"; return 0; fi
-              log "[RETRY] $name rc=$rc"
-              sleep 5
+              log "[RETRY] $name rc=$rc"; sleep 3
               "$@" 2>&1 | stdbuf -oL -eL tee -a "$LOG" >&2
               rc=${PIPESTATUS[0]}
               if [ "$rc" -eq 0 ]; then log "[OK] $name (retry)"; return 0; fi
@@ -163,7 +120,7 @@ jobs:
 
           s00_env() {
               uname -a; head -2 /etc/os-release; nproc; free -h; df -h /
-              for t in git curl gcc make ccache python3 zip unzip java repo; do
+              for t in git curl gcc make ccache python3 zip unzip java; do
                   command -v $t || echo "MISSING $t"
               done
           }
@@ -181,42 +138,51 @@ jobs:
               repo --version
           }
 
-          # Sync: thử repo init trực tiếp trước, fallback về orangefox_sync.sh
+          # Sync: thử repo init trực tiếp, fallback orangefox_sync.sh
           s03_sync_fox() {
               export PATH="/root/.bin:$PATH"
               cd "$WORKDIR" || return 1
-
               if [ ! -d "$FOX_PATH/.repo" ]; then
                   mkdir -p "$FOX_PATH"
                   cd "$FOX_PATH" || return 1
-                  echo ">>> [try1] repo init direct..."
+                  echo ">>> repo init direct..."
                   set -x
                   repo init --depth=1 -u https://gitlab.com/OrangeFox/Manifest.git -b fox_11.0 2>&1
                   local rc=$?
                   set +x
                   if [ $rc -eq 0 ]; then
-                      echo ">>> repo init OK — repo sync..."
                       repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags 2>&1
                       return $?
                   fi
-                  echo ">>> [try1] repo init failed rc=$rc — fallback orangefox_sync.sh"
+                  echo ">>> fallback orangefox_sync.sh"
                   cd "$WORKDIR" || return 1
                   rm -rf "$FOX_PATH" "$WORKDIR/sync"
                   git clone https://gitlab.com/OrangeFox/sync.git -b fox_11.0 --depth=1 "$WORKDIR/sync" || return 1
                   ( cd "$WORKDIR/sync" && ./orangefox_sync.sh --branch "$FOX_BRANCH" --path "$FOX_PATH" )
                   return $?
-              else
-                  cd "$FOX_PATH" || return 1
-                  repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags 2>&1
-                  return $?
               fi
+              cd "$FOX_PATH" || return 1
+              repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags 2>&1
+              return $?
           }
 
+          # Clone device tree: thử PRIMARY -> ALT1 -> ALT2
           s04_clone_dt() {
               mkdir -p "$FOX_PATH/device/samsung"
               rm -rf "$FOX_PATH/device/samsung/$DEVICE"
-              git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" \
-                  "$FOX_PATH/device/samsung/$DEVICE"
+              local branches=("$DEVICE_TREE_BRANCH_PRIMARY" "$DEVICE_TREE_BRANCH_ALT1" "$DEVICE_TREE_BRANCH_ALT2")
+              local b
+              for b in "${branches[@]}"; do
+                  echo ">>> try device tree branch: $b"
+                  if git clone --depth=1 -b "$b" "$DEVICE_TREE_URL" \
+                        "$FOX_PATH/device/samsung/$DEVICE" 2>&1 | tee -a "$LOG"; then
+                      echo ">>> SUCCESS device tree branch=$b"
+                      echo "DEVICE_TREE_BRANCH_USED=$b" > "$WORKDIR/ai/dt_branch.txt"
+                      return 0
+                  fi
+                  rm -rf "$FOX_PATH/device/samsung/$DEVICE"
+              done
+              return 1
           }
 
           s05_clone_deps() {
@@ -241,7 +207,7 @@ jobs:
 
           s06_build() {
               cd "$FOX_PATH" || return 1
-              [ -f build/envsetup.sh ] || { echo "!!! No build/envsetup.sh (sync chưa xong)"; return 1; }
+              [ -f build/envsetup.sh ] || { echo "!!! No build/envsetup.sh"; return 1; }
               export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1
               export CCACHE_DIR="/root/.ccache" CCACHE_COMPRESS=1 CCACHE_MAXSIZE="$CCACHE_MAX"
               source build/envsetup.sh || return 1
@@ -255,7 +221,6 @@ jobs:
               find "$out" -maxdepth 1 -type f \
                   \( -name 'recovery.img' -o -name 'OrangeFox*.zip' \) \
                   -exec cp -v {} "$ART_DIR"/ \; || true
-              ls -la "$ART_DIR"
               [ -f "$ART_DIR/recovery.img" ] || ls "$ART_DIR"/OrangeFox*.zip >/dev/null 2>&1
           }
 
@@ -267,7 +232,7 @@ jobs:
               if [ -n "$ofox_zip" ] && [ -f "$ofox_zip" ]; then
                   cp -f "$ofox_zip" "$ZIP_NAME"; return 0
               fi
-              [ -f recovery.img ] || { echo "no recovery.img"; return 1; }
+              [ -f recovery.img ] || return 1
               mkdir -p _pkg/META-INF/com/google/android
               cp recovery.img _pkg/recovery.img
               cat > _pkg/META-INF/com/google/android/update-binary <<'EOS'
@@ -312,134 +277,55 @@ jobs:
           fi
           BUILDEOF
 
-          chmod +x /tmp/of_build.sh
-          bash -n /tmp/of_build.sh || { echo "SYNTAX ERROR"; exit 1; }
+          chmod +x "$WORKDIR/of_build.sh"
+          bash -n "$WORKDIR/of_build.sh" || { echo "SYNTAX ERROR build script"; exit 1; }
+          echo "Bootstrap done."
 
-          # ===================== AI system prompt (heredoc, 10-space indent) =====================
+      - name: AI-everywhere build loop
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          START=$(date +%s)
+          ATTEMPT=0
+          ZERO_CCACHE_HITS=0
+
+          # AI system prompt (heredoc, đúng indent)
           cat > /tmp/ai_system_raw.txt <<'SYSEOF'
-          You are an expert at fixing Android OrangeFox/TWRP build failures.
-          Output ONLY a bash script (no markdown fences, no explanation).
-          The script runs inside debian:bullseye as root, inside container that has git, curl, repo at /root/.bin/repo.
-          Context: AOSP 11.0 build for Samsung hero2lte (Galaxy S7 edge).
-          Constraints:
-          - Whitelisted commands ONLY: apt-get git curl wget repo mkdir rm cp mv ln chmod export source cd echo sed tee tar unzip zip find grep awk head tail cat true false if then else elif fi for do done while case esac
-          - Max 40 lines.
-          - If you cannot determine a fix, output one line: # NO FIX
-          - NEVER use: eval, sh -c, bash -c, base64, xargs, pipe into sh/bash, wget -O -, curl -o - piped, su, sudo, systemctl, mount, umount, dd, chown.
-          - Common real fixes you should consider:
-            * repo: command not found -> export PATH=/root/.bin:$PATH
-            * missing build/envsetup.sh -> cd /workspace/foxbuild/11.0 && repo sync -j1 --force-sync
-            * out of disk -> apt-get clean; rm -rf /tmp/*; rm -rf /root/.cache
-            * device tree missing deps -> echo "set DEP_HERO_COMMON_URL / DEP_UNIVERSAL8890_URL / DEP_HW_SAMSUNG_URL"
-            * lunch target unknown -> echo "try fox_hero2lte-eng or omni_hero2lte-eng"
-            * git LFS pointer files -> git lfs install; git lfs pull (only if git-lfs is present)
-          SYSEOF
-          sed -e 's/^          //' -e '/^$/d' /tmp/ai_system_raw.txt > /tmp/ai_system.txt
+          You are an autonomous Android OrangeFox/TWRP build fixer for Samsung hero2lte (Galaxy S7 edge).
+          Your output is a BASH SCRIPT that will be executed INSIDE ubuntu:22.04 as root,
+          with /workspace/foxbuild mounted at /workspace/foxbuild (same as host WORKDIR).
 
-          ai_fix() {
-              local log_file="$WORKDIR/build.log"
-              [ -f "$log_file" ] || return 1
-              tail -n 3000 "$log_file" | head -c 100000 > /tmp/log_snip.txt
-              jq -n --rawfile sys /tmp/ai_system.txt --rawfile log /tmp/log_snip.txt '{
-                  model: "gpt-4o-mini",
-                  messages: [
-                      {role:"system", content:$sys},
-                      {role:"user", content:("BUILD LOG:\n" + $log + "\n\nFix script:")}
-                  ],
-                  max_tokens: 1500, temperature: 0.1
-              }' > /tmp/ai_req.json
-              local resp
-              resp=$(curl -sS -X POST "$AI_ENDPOINT" \
-                  -H "Authorization: Bearer $GITHUB_TOKEN" \
-                  -H "Content-Type: application/json" \
-                  -d @/tmp/ai_req.json 2>&1)
-              echo "$resp" > /tmp/ai_resp.json
-              local content
-              content=$(jq -r '.choices[0].message.content // empty' /tmp/ai_resp.json 2>/dev/null)
-              if [ -z "$content" ]; then
-                  echo "AI call failed:"; head -c 400 /tmp/ai_resp.json; echo; return 1
-              fi
-              printf '%s\n' "$content" | sed -e 's/^```[a-zA-Z]*$//' -e 's/^```$//' > /tmp/ai_fix.sh
-              echo "─── AI suggested fix ───"
-              cat /tmp/ai_fix.sh
-              echo "────────────────────────"
-              local bad=0 line_no=0 line trimmed
-              while IFS= read -r line; do
-                  line_no=$((line_no + 1))
-                  trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
-                  [ -z "$trimmed" ] && continue
-                  case "$trimmed" in
-                      \#*) continue ;;
-                      [A-Za-z_][A-Za-z0-9_]*=*) continue ;;
-                      if\ *|then|else|elif\ *|fi|for\ *|do|done|while\ *|case\ *|esac) continue ;;
-                      apt-get*|git*|curl*|wget*|repo*|mkdir*|rm*|cp*|mv*|ln*|chmod*|export*|source*|cd*|echo*|sed*|tee*|tar*|unzip*|zip*|find*|grep*|awk*|head*|tail*|cat*|true|false) continue ;;
-                  esac
-                  echo "✗ Line $line_no not whitelisted: $trimmed"; bad=1
-              done < /tmp/ai_fix.sh
-              if [ $bad -ne 0 ]; then echo "✗ AI fix rejected"; return 1; fi
-              if grep -qxF '# NO FIX' /tmp/ai_fix.sh; then echo "AI: NO FIX"; return 1; fi
-              bash -n /tmp/ai_fix.sh || { echo "✗ AI script syntax error"; return 1; }
-              echo "✓ AI fix validated"; return 0
-          }
+          You can fix ANYTHING by editing files under /workspace/foxbuild/:
+          - /workspace/foxbuild/Dockerfile         (base image, packages, build deps)
+          - /workspace/foxbuild/of_build.sh        (build orchestration)
+          - /workspace/foxbuild/ai/ai_fix.sh       (not needed here, you ARE writing the next fix)
 
-          # ===================== MAIN LOOP =====================
-          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-              echo "════════ ATTEMPT $attempt / $MAX_ATTEMPTS ════════"
-              rm -f "$WORKDIR/.build_done"
-              : > "$WORKDIR/build.log"
+          Current context:
+          - Default Dockerfile uses ubuntu:22.04 (fully supported, no 404).
+          - Default build script tries device tree branches in order:
+            fox_11.0, fox_9.0, main. All from https://github.com/OrangeFoxRecovery/device_samsung_hero2lte.git
+          - Repo sync uses https://gitlab.com/OrangeFox/Manifest.git branch fox_11.0, fallback orangefox_sync.sh.
 
-              docker run --rm \
-                  -v "${{ github.workspace }}:/workspace" \
-                  -v "$HOME/.ccache:/root/.ccache" \
-                  -v "/tmp/of_build.sh:/of_build.sh:ro" \
-                  -w /workspace \
-                  -e WORKDIR="/workspace/foxbuild" \
-                  -e FOX_BRANCH="$FOX_BRANCH" -e JOBS="$JOBS" \
-                  -e CCACHE_MAX="$CCACHE_MAX" -e ZIP_NAME="$ZIP_NAME" \
-                  -e DEVICE_TREE_URL="$DEVICE_TREE_URL" \
-                  -e DEVICE_TREE_BRANCH="$DEVICE_TREE_BRANCH" \
-                  -e DEP_HERO_COMMON_URL="$DEP_HERO_COMMON_URL" \
-                  -e DEP_HERO_COMMON_BRANCH="$DEP_HERO_COMMON_BRANCH" \
-                  -e DEP_UNIVERSAL8890_URL="$DEP_UNIVERSAL8890_URL" \
-                  -e DEP_UNIVERSAL8890_BRANCH="$DEP_UNIVERSAL8890_BRANCH" \
-                  -e DEP_HW_SAMSUNG_URL="$DEP_HW_SAMSUNG_URL" \
-                  -e DEP_HW_SAMSUNG_BRANCH="$DEP_HW_SAMSUNG_BRANCH" \
-                  foxbuilder:hero2lte bash /of_build.sh
-              echo "─── docker exit=$? ───"
+          Rules for your output:
+          - Output ONLY bash script. No markdown. No explanation.
+          - Whitelisted/blacklisted: NEVER use eval, sh -c, bash -c, base64 -d, sudo, mount, umount, dd.
+          - Never pipe curl/wget into sh/bash.
+          - Never write outside /workspace/foxbuild/ or /tmp/.
+          - Prefer minimal edits (sed -i, echo >>, cat > ... <<EOF).
+          - If you cannot determine a safe fix, output exactly: # NO FIX
 
-              if [ -f "$WORKDIR/artifacts/$ZIP_NAME" ]; then
-                  echo "✓ BUILD SUCCESS on attempt $attempt"
-                  exit 0
-              fi
-              if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then break; fi
+          Common strategies you SHOULD apply when relevant:
+          - apt 404 on package: append `apt-get update` then retry, or change base image in Dockerfile to debian:12 / ubuntu:24.04.
+          - git/repo missing: add to Dockerfile apt list.
+          - repo init/sync failure: try alternate manifest URLs (github.com/OrangeFoxRecovery/platform_manifest) or emit `# NO FIX` so human sees.
+          - Missing device dependencies: ADD git clone lines to s05_clone_deps in of_build.sh.
+            Known useful repos for hero2lte (fill DEP_* env vars or inline clone):
+              * https://github.com/LineageOS/android_device_samsung_hero-common (branch lineage-18.1)
+              * https://github.com/LineageOS/android_kernel_samsung_universal8890 (branch lineage-18.1)
+              * https://github.com/LineageOS/android_hardware_samsung (branch lineage-18.1)
+          - lunch target unknown: append `grep -r 'add_lunch_combo' device/samsung/hero2lte/` to log and try both fox_hero2lte-eng and omni_hero2lte-eng.
+          - Out of disk / OOM: in of_build.sh, `apt-get clean; rm -rf /tmp/*; ccache -C` before mka; add `export LC_ALL=C` and lower `-j` if needed.
+          - Sync succeeded but build/envsetup.sh missing: repo sync did not finish — append `repo sync -j1 --force-sync` to s03.
 
-              echo "─── Asking AI to diagnose + fix ───"
-              if ai_fix; then
-                  cp /tmp/ai_fix.sh "$WORKDIR/.ai_fix.sh"
-                  echo "─── AI fix saved for attempt $((attempt+1)) ───"
-              else
-                  echo "AI không đề xuất fix an toàn → attempt sau chạy lại y nguyên"
-              fi
-              sleep 5
-          done
-
-          ls -la "$WORKDIR/artifacts" || true
-          [ -f "$WORKDIR/artifacts/$ZIP_NAME" ] && exit 0 || exit 1
-
-      - name: Upload zip
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: OrangeFox-hero2lte-TWRP
-          path: ${{ env.WORKDIR }}/artifacts/*.zip
-          if-no-files-found: warn
-
-      - name: Upload build.log + AI fix trace
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-and-ai-fix
-          path: |
-            ${{ env.WORKDIR }}/build.log
-            ${{ env.WORKDIR }}/.ai_fix.sh
-          if-no-files-found: warn
+          Output example (do NOT copy verbatim, adapt to actual failure):
