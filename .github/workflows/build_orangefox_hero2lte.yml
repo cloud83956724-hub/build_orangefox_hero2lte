@@ -1,0 +1,266 @@
+name: Build OrangeFox hero2lte (A-Z single file)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    timeout-minutes: 350
+
+    env:
+      WORKDIR: ${{ github.workspace }}/foxbuild
+      FOX_BRANCH: "11.0"
+      JOBS: "4"
+      CCACHE_MAX: "20G"
+      ZIP_NAME: "OrangeFox-hero2lte-TWRP.zip"
+
+      DEVICE_TREE_URL: "https://github.com/OrangeFoxRecovery/device_samsung_hero2lte.git"
+      DEVICE_TREE_BRANCH: "fox_11.0"
+
+      # Điền nếu device tree cần thêm repo phụ thuộc (để trống = bỏ qua)
+      DEP_HERO_COMMON_URL: ""
+      DEP_HERO_COMMON_BRANCH: "fox_11.0"
+      DEP_UNIVERSAL8890_URL: ""
+      DEP_UNIVERSAL8890_BRANCH: "fox_11.0"
+      DEP_HW_SAMSUNG_URL: ""
+      DEP_HW_SAMSUNG_BRANCH: "fox_11.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-hero2lte-${{ github.sha }}
+          restore-keys: |
+            ccache-hero2lte-
+
+      - name: Build OrangeFox A-Z
+        run: |
+          #!/usr/bin/env bash
+          set +e
+          set -o pipefail
+
+          DEVICE="hero2lte"
+          FOX_PATH="$WORKDIR/$FOX_BRANCH"
+          ART_DIR="$WORKDIR/artifacts"
+          LOG="$WORKDIR/build.log"
+          FAILED=()
+
+          mkdir -p "$WORKDIR" "$ART_DIR" "$HOME/.ccache"
+          : > "$LOG"
+
+          log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+
+          retry_step() {
+            local name="$1"; shift
+            log "================ STEP: $name ================"
+            if "$@" >>"$LOG" 2>&1; then
+              log "[OK]   $name"; return 0
+            fi
+            log "[RETRY] $name failed -> retry once in 10s"
+            sleep 10
+            if "$@" >>"$LOG" 2>&1; then
+              log "[OK]   $name (retry succeeded)"; return 0
+            fi
+            log "[FAIL] $name failed after retry -> CONTINUE"
+            FAILED+=("$name"); return 0
+          }
+
+          # ---------- 01: Free disk ----------
+          s01_free_disk() {
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc 2>/dev/null || true
+            sudo apt-get clean
+          }
+
+          # ---------- 02: Install deps ----------
+          s02_install_deps() {
+            sudo apt-get update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+              git curl zip unzip python3 python-is-python3 ccache lzop \
+              build-essential flex bison zlib1g-dev gcc-multilib g++-multilib \
+              libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev libx11-dev \
+              lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc fontconfig \
+              openjdk-11-jdk libssl-dev
+          }
+
+          # ---------- 03: Swap 8G ----------
+          s03_swap() {
+            if [ ! -f /swapfile ]; then
+              sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+              sudo chmod 600 /swapfile
+              sudo mkswap /swapfile
+            fi
+            sudo swapon /swapfile || true
+            sudo swapon --show || true
+          }
+
+          # ---------- 04: ccache ----------
+          s04_ccache() {
+            export CCACHE_DIR="$HOME/.ccache"
+            ccache -M "$CCACHE_MAX"
+            ccache -z
+            echo "CCACHE_DIR=$CCACHE_DIR" >> "$GITHUB_ENV"
+            echo "USE_CCACHE=1"        >> "$GITHUB_ENV"
+          }
+
+          # ---------- 05: repo tool ----------
+          s05_repo_tool() {
+            mkdir -p "$HOME/.bin"
+            curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.bin/repo"
+            chmod +x "$HOME/.bin/repo"
+            export PATH="$HOME/.bin:$PATH"
+            echo "$HOME/.bin" >> "$GITHUB_PATH"
+            "$HOME/.bin/repo" --version
+          }
+
+          # ---------- 06: sync OrangeFox ----------
+          s06_sync_fox() {
+            export PATH="$HOME/.bin:$PATH"
+            if [ ! -d "$FOX_PATH/.repo" ]; then
+              rm -rf "$WORKDIR/sync"
+              git clone https://gitlab.com/OrangeFox/sync.git -b fox_11.0 --depth=1 "$WORKDIR/sync"
+              ( cd "$WORKDIR/sync" && ./orangefox_sync.sh --branch "$FOX_BRANCH" --path "$FOX_PATH" )
+            else
+              ( cd "$FOX_PATH" && repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags )
+            fi
+          }
+
+          # ---------- 07: clone device tree ----------
+          s07_clone_dt() {
+            mkdir -p "$FOX_PATH/device/samsung"
+            rm -rf "$FOX_PATH/device/samsung/$DEVICE"
+            git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" \
+              "$FOX_PATH/device/samsung/$DEVICE"
+          }
+
+          # ---------- 08: clone extra deps ----------
+          s08_clone_deps() {
+            cd "$FOX_PATH" || return 1
+            if [ -n "$DEP_HERO_COMMON_URL" ] && [ ! -d device/samsung/hero-common ]; then
+              git clone --depth=1 -b "$DEP_HERO_COMMON_BRANCH" \
+                "$DEP_HERO_COMMON_URL" device/samsung/hero-common || return 1
+            fi
+            if [ -n "$DEP_UNIVERSAL8890_URL" ] && [ ! -d kernel/samsung/universal8890 ]; then
+              mkdir -p kernel/samsung
+              git clone --depth=1 -b "$DEP_UNIVERSAL8890_BRANCH" \
+                "$DEP_UNIVERSAL8890_URL" kernel/samsung/universal8890 || return 1
+            fi
+            if [ -n "$DEP_HW_SAMSUNG_URL" ] && [ ! -d hardware/samsung ]; then
+              mkdir -p hardware
+              git clone --depth=1 -b "$DEP_HW_SAMSUNG_BRANCH" \
+                "$DEP_HW_SAMSUNG_URL" hardware/samsung || return 1
+            fi
+            return 0
+          }
+
+          # ---------- 09: build ----------
+          s09_build() {
+            cd "$FOX_PATH" || return 1
+            export ALLOW_MISSING_DEPENDENCIES=true
+            export LC_ALL=C
+            export USE_CCACHE=1
+            export CCACHE_DIR="$HOME/.ccache"
+            export CCACHE_COMPRESS=1
+            export CCACHE_MAXSIZE="$CCACHE_MAX"
+            source build/envsetup.sh || return 1
+            if ! lunch omni_${DEVICE}-eng; then
+              lunch fox_${DEVICE}-eng || return 1
+            fi
+            mka recoveryimage -j"$JOBS"
+          }
+
+          # ---------- 10: collect ----------
+          s10_collect() {
+            local out="$FOX_PATH/out/target/product/$DEVICE"
+            [ -d "$out" ] || { echo "out missing: $out"; return 1; }
+            find "$out" -maxdepth 1 -type f \
+              \( -name 'recovery.img' -o -name 'OrangeFox*.zip' \) \
+              -exec cp -v {} "$ART_DIR"/ \; || true
+            ls -la "$ART_DIR"
+            [ -f "$ART_DIR/recovery.img" ] || ls "$ART_DIR"/OrangeFox*.zip >/dev/null 2>&1
+          }
+
+          # ---------- 11: package zip ----------
+          s11_package_zip() {
+            cd "$ART_DIR" || return 1
+            rm -rf _pkg
+            local ofox_zip
+            ofox_zip=$(ls -1 OrangeFox*.zip 2>/dev/null | grep -vxF "$ZIP_NAME" | head -n1 || true)
+            if [ -n "$ofox_zip" ] && [ -f "$ofox_zip" ]; then
+              cp -f "$ofox_zip" "$ZIP_NAME"
+              return 0
+            fi
+            [ -f recovery.img ] || { echo "no recovery.img and no OrangeFox zip"; return 1; }
+
+            mkdir -p _pkg/META-INF/com/google/android
+            cp recovery.img _pkg/recovery.img
+
+            cat > _pkg/META-INF/com/google/android/update-binary <<'EOS'
+          #!/sbin/sh
+          OUTFD=$2
+          ZIPFILE=$3
+          ui_print() { echo "ui_print $1" >&$OUTFD; echo "ui_print" >&$OUTFD; }
+          ui_print "OrangeFox installer (hero2lte)"
+          rm -rf /tmp/of_pkg; mkdir -p /tmp/of_pkg; cd /tmp/of_pkg || exit 1
+          unzip -o "$ZIPFILE" recovery.img || exit 1
+          BLK="/dev/block/by-name/RECOVERY"
+          [ -e "$BLK" ] || BLK=$(find /dev/block/platform -type l -name RECOVERY 2>/dev/null | head -n1)
+          [ -n "$BLK" ] && [ -e "$BLK" ] || { ui_print "RECOVERY partition not found"; exit 1; }
+          ui_print "Flashing to $BLK"
+          dd if=recovery.img of="$BLK" bs=4M || exit 1
+          sync
+          ui_print "Flash complete"
+          EOS
+            chmod +x _pkg/META-INF/com/google/android/update-binary
+            printf 'ui_print("OrangeFox recovery flash");\n' \
+              > _pkg/META-INF/com/google/android/updater-script
+
+            rm -f "$ZIP_NAME"
+            ( cd _pkg && zip -r "../$ZIP_NAME" . >/dev/null )
+            local rc=$?
+            rm -rf _pkg
+            return $rc
+          }
+
+          # ---------- RUN ----------
+          retry_step "01_free_disk"    s01_free_disk
+          retry_step "02_install_deps" s02_install_deps
+          retry_step "03_swap"         s03_swap
+          retry_step "04_ccache"       s04_ccache
+          retry_step "05_repo_tool"    s05_repo_tool
+          retry_step "06_sync_fox"     s06_sync_fox
+          retry_step "07_clone_dt"     s07_clone_dt
+          retry_step "08_clone_deps"   s08_clone_deps
+          retry_step "09_build"        s09_build
+          retry_step "10_collect"      s10_collect
+          retry_step "11_package_zip"  s11_package_zip
+
+          log "================ SUMMARY ================"
+          if [ "${#FAILED[@]}" -eq 0 ]; then
+            log "All steps OK"
+          else
+            log "Failed steps (đã đi tiếp):"
+            for s in "${FAILED[@]}"; do log "  - $s"; done
+          fi
+
+          if [ -f "$ART_DIR/$ZIP_NAME" ]; then
+            log "Artifact: $ART_DIR/$ZIP_NAME"
+            ls -lh "$ART_DIR/$ZIP_NAME"
+          else
+            log "Không tạo được zip. Xem log đầy đủ bên dưới:"
+            tail -n 200 "$LOG" || true
+          fi
+
+      - name: Upload zip (TWRP flashable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrangeFox-hero2lte-TWRP
+          path: ${{ env.WORKDIR }}/artifacts/*.zip
+          if-no-files-found: warn
