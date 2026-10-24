@@ -1,4 +1,4 @@
-name: Build OrangeFox hero2lte (A-Z single file)
+name: Build OrangeFox hero2lte (A-Z single file v2)
 
 on:
   workflow_dispatch:
@@ -37,79 +37,95 @@ jobs:
           restore-keys: |
             ccache-hero2lte-
 
-      - name: Setup swap on host (8G, dùng chung cho container)
+      - name: Setup swap (recreate 8G on host)
         run: |
-          if [ ! -f /swapfile ]; then
-            sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
-            sudo chmod 600 /swapfile
-            sudo mkswap /swapfile
-          fi
-          sudo swapon /swapfile || true
-          sudo swapon --show || true
+          set -x
+          sudo swapoff /swapfile 2>/dev/null || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo swapon --show
           free -h
-          docker --version
 
       - name: Build A-Z in ubuntu:20.04 container
         run: |
           set +e
+          mkdir -p "$WORKDIR/artifacts"
+          rm -f "$WORKDIR/.build_done"
 
           cat > /tmp/of_build.sh <<'BUILDEOF'
           #!/bin/bash
           set +e
-          set -o pipefail
           export DEBIAN_FRONTEND=noninteractive
+          export LC_ALL=C
 
           DEVICE="hero2lte"
           FOX_PATH="$WORKDIR/$FOX_BRANCH"
           ART_DIR="$WORKDIR/artifacts"
           LOG="$WORKDIR/build.log"
+          SENTINEL="$WORKDIR/.build_done"
           FAILED=()
 
           mkdir -p "$WORKDIR" "$ART_DIR" "/root/.ccache"
           : > "$LOG"
 
-          log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG"; }
+          log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
           retry_step() {
             local name="$1"; shift
-            log "================ STEP: $name ================"
-            if "$@" 2>&1 | tee -a "$LOG"; then
-              log "[OK]   $name"; return 0
-            fi
-            log "[RETRY] $name failed -> retry once in 10s"
+            log "================================================================"
+            log "STEP START: $name"
+            log "================================================================"
+            "$@" 2>&1 | tee -a "$LOG" >&2
+            local rc=${PIPESTATUS[0]}
+            if [ "$rc" -eq 0 ]; then log "[OK]   $name (rc=0)"; return 0; fi
+            log "[RETRY] $name failed (rc=$rc) -> retry once in 10s"
             sleep 10
-            if "$@" 2>&1 | tee -a "$LOG"; then
-              log "[OK]   $name (retry succeeded)"; return 0
-            fi
-            log "[FAIL] $name failed after retry -> CONTINUE"
+            "$@" 2>&1 | tee -a "$LOG" >&2
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -eq 0 ]; then log "[OK]   $name (retry succeeded)"; return 0; fi
+            log "[FAIL] $name failed after retry (rc=$rc) -> CONTINUE"
             FAILED+=("$name"); return 0
           }
 
           s00_env() {
             uname -a
             cat /etc/os-release
-            nproc
-            free -h
+            command -v nproc >/dev/null && nproc || echo "nproc missing"
+            command -v free  >/dev/null && free -h || echo "free missing (base image minimal)"
+            df -h / || true
+            echo "WORKDIR=$WORKDIR  FOX_PATH=$FOX_PATH"
           }
 
-          s01_install_deps() {
-            apt-get update
-            apt-get install -y \
-              git curl zip unzip python3 python-is-python3 ccache lzop \
-              build-essential flex bison zlib1g-dev gcc-multilib g++-multilib \
-              libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev libx11-dev \
-              lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc fontconfig \
-              openjdk-11-jdk libssl-dev
+          s01_fix_sources() {
+            # Ubuntu 20.04 đã EOL standard support -> archive/security không serve focal nữa.
+            # Chuyển sang old-releases.ubuntu.com để apt còn tải được package focal.
+            sed -i 's|http://archive.ubuntu.com|http://old-releases.ubuntu.com|g; s|http://security.ubuntu.com|http://old-releases.ubuntu.com|g' /etc/apt/sources.list
+            echo "----- /etc/apt/sources.list -----"
+            grep -vE '^\s*#|^\s*$' /etc/apt/sources.list || true
+            echo "---------------------------------"
           }
 
-          s02_ccache() {
+          s02_install_deps() {
+            apt-get update -y
+            apt-get install -y --no-install-recommends \
+              ca-certificates git curl wget zip unzip \
+              python3 python-is-python3 ccache lzop rsync procps \
+              build-essential flex bison gperf \
+              zlib1g-dev gcc-multilib g++-multilib \
+              libc6-dev-i386 lib32ncurses5-dev x11proto-core-dev \
+              libx11-dev lib32z1-dev libgl1-mesa-dev libxml2-utils \
+              xsltproc fontconfig openjdk-11-jdk libssl-dev
+          }
+
+          s03_ccache() {
             export CCACHE_DIR="/root/.ccache"
-            ccache -M "$CCACHE_MAX"
-            ccache -z
-            ccache -s
+            ccache -M "$CCACHE_MAX"; ccache -z; ccache -s
           }
 
-          s03_repo_tool() {
+          s04_repo_tool() {
             mkdir -p /root/.bin
             curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o /root/.bin/repo
             chmod +x /root/.bin/repo
@@ -117,25 +133,25 @@ jobs:
             /root/.bin/repo --version
           }
 
-          s04_sync_fox() {
+          s05_sync_fox() {
             export PATH="/root/.bin:$PATH"
             if [ ! -d "$FOX_PATH/.repo" ]; then
               rm -rf "$WORKDIR/sync"
-              git clone https://gitlab.com/OrangeFox/sync.git -b fox_11.0 --depth=1 "$WORKDIR/sync"
+              git clone https://gitlab.com/OrangeFox/sync.git -b fox_11.0 --depth=1 "$WORKDIR/sync" || return 1
               ( cd "$WORKDIR/sync" && ./orangefox_sync.sh --branch "$FOX_BRANCH" --path "$FOX_PATH" )
             else
               ( cd "$FOX_PATH" && repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags )
             fi
           }
 
-          s05_clone_dt() {
+          s06_clone_dt() {
             mkdir -p "$FOX_PATH/device/samsung"
             rm -rf "$FOX_PATH/device/samsung/$DEVICE"
             git clone --depth=1 -b "$DEVICE_TREE_BRANCH" "$DEVICE_TREE_URL" \
               "$FOX_PATH/device/samsung/$DEVICE"
           }
 
-          s06_clone_deps() {
+          s07_clone_deps() {
             cd "$FOX_PATH" || return 1
             if [ -n "$DEP_HERO_COMMON_URL" ] && [ ! -d device/samsung/hero-common ]; then
               git clone --depth=1 -b "$DEP_HERO_COMMON_BRANCH" "$DEP_HERO_COMMON_URL" device/samsung/hero-common || return 1
@@ -151,22 +167,17 @@ jobs:
             return 0
           }
 
-          s07_build() {
+          s08_build() {
             cd "$FOX_PATH" || return 1
             export ALLOW_MISSING_DEPENDENCIES=true
-            export LC_ALL=C
-            export USE_CCACHE=1
-            export CCACHE_DIR="/root/.ccache"
-            export CCACHE_COMPRESS=1
-            export CCACHE_MAXSIZE="$CCACHE_MAX"
+            export USE_CCACHE=1 CCACHE_DIR="/root/.ccache"
+            export CCACHE_COMPRESS=1 CCACHE_MAXSIZE="$CCACHE_MAX"
             source build/envsetup.sh || return 1
-            if ! lunch omni_${DEVICE}-eng; then
-              lunch fox_${DEVICE}-eng || return 1
-            fi
+            if ! lunch omni_${DEVICE}-eng; then lunch fox_${DEVICE}-eng || return 1; fi
             mka recoveryimage -j"$JOBS"
           }
 
-          s08_collect() {
+          s09_collect() {
             local out="$FOX_PATH/out/target/product/$DEVICE"
             [ -d "$out" ] || { echo "out missing: $out"; return 1; }
             find "$out" -maxdepth 1 -type f \
@@ -176,14 +187,13 @@ jobs:
             [ -f "$ART_DIR/recovery.img" ] || ls "$ART_DIR"/OrangeFox*.zip >/dev/null 2>&1
           }
 
-          s09_package() {
+          s10_package() {
             cd "$ART_DIR" || return 1
             rm -rf _pkg
             local ofox_zip
             ofox_zip=$(ls -1 OrangeFox*.zip 2>/dev/null | grep -vxF "$ZIP_NAME" | head -n1 || true)
             if [ -n "$ofox_zip" ] && [ -f "$ofox_zip" ]; then
-              cp -f "$ofox_zip" "$ZIP_NAME"
-              return 0
+              cp -f "$ofox_zip" "$ZIP_NAME"; return 0
             fi
             [ -f recovery.img ] || { echo "no recovery.img and no OrangeFox zip"; return 1; }
             mkdir -p _pkg/META-INF/com/google/android
@@ -208,40 +218,43 @@ jobs:
             printf 'ui_print("OrangeFox recovery flash");\n' > _pkg/META-INF/com/google/android/updater-script
             rm -f "$ZIP_NAME"
             ( cd _pkg && zip -r "../$ZIP_NAME" . >/dev/null )
-            local rc=$?
-            rm -rf _pkg
-            return $rc
+            local rc=$?; rm -rf _pkg; return $rc
           }
 
-          retry_step "00_env"          s00_env
-          retry_step "01_install_deps" s01_install_deps
-          retry_step "02_ccache"       s02_ccache
-          retry_step "03_repo_tool"    s03_repo_tool
-          retry_step "04_sync_fox"     s04_sync_fox
-          retry_step "05_clone_dt"     s05_clone_dt
-          retry_step "06_clone_deps"   s06_clone_deps
-          retry_step "07_build"        s07_build
-          retry_step "08_collect"      s08_collect
-          retry_step "09_package"      s09_package
+          retry_step "00_env"           s00_env
+          retry_step "01_fix_sources"   s01_fix_sources
+          retry_step "02_install_deps"  s02_install_deps
+          retry_step "03_ccache"        s03_ccache
+          retry_step "04_repo_tool"     s04_repo_tool
+          retry_step "05_sync_fox"      s05_sync_fox
+          retry_step "06_clone_dt"      s06_clone_dt
+          retry_step "07_clone_deps"    s07_clone_deps
+          retry_step "08_build"         s08_build
+          retry_step "09_collect"       s09_collect
+          retry_step "10_package"       s10_package
 
-          log "================ SUMMARY ================"
-          if [ "${#FAILED[@]}" -eq 0 ]; then
-            log "All steps OK"
+          log "================================================================"
+          log "SUMMARY"
+          log "================================================================"
+          if [ "${#FAILED[@]}" -eq 0 ]; then log "All steps OK"
           else
             log "Failed steps (đã đi tiếp):"
             for s in "${FAILED[@]}"; do log "  - $s"; done
           fi
 
           if [ -f "$ART_DIR/$ZIP_NAME" ]; then
-            log "Artifact: $ART_DIR/$ZIP_NAME"
+            log "ARTIFACT OK: $ART_DIR/$ZIP_NAME"
             ls -lh "$ART_DIR/$ZIP_NAME"
+            touch "$SENTINEL"
           else
-            log "Không tạo được zip. Tail log:"
-            tail -n 300 "$LOG" || true
+            log "NO ARTIFACT produced"
           fi
+          log "=== CONTAINER SCRIPT END ==="
           BUILDEOF
 
           chmod +x /tmp/of_build.sh
+          echo "=== script lines: $(wc -l < /tmp/of_build.sh) ==="
+          bash -n /tmp/of_build.sh && echo "syntax OK" || echo "SYNTAX ERROR"
 
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
@@ -262,7 +275,25 @@ jobs:
             -e DEP_HW_SAMSUNG_URL="$DEP_HW_SAMSUNG_URL" \
             -e DEP_HW_SAMSUNG_BRANCH="$DEP_HW_SAMSUNG_BRANCH" \
             ubuntu:20.04 bash /of_build.sh
-          echo "docker run exit=$?"
+          echo "=== docker exit=$? ==="
+
+          echo "=== SENTINEL check ==="
+          if [ -f "$WORKDIR/.build_done" ]; then
+            echo "OK: container chạy hết script và có artifact."
+          else
+            echo "WARN: container thoát sớm / không có artifact — xem log bên dưới."
+          fi
+
+          echo "=== FULL build.log (host side) ==="
+          if [ -f "$WORKDIR/build.log" ]; then
+            wc -l "$WORKDIR/build.log"
+            cat "$WORKDIR/build.log"
+          else
+            echo "No build.log found"
+          fi
+
+          echo "=== artifacts ==="
+          ls -la "$WORKDIR/artifacts" || true
 
       - name: Upload zip (TWRP flashable)
         if: always()
