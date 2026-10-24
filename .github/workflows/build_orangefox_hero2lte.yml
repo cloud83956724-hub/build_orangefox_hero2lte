@@ -1,4 +1,4 @@
-name: Build OrangeFox hero2lte (A-Z + AI auto-fix v5)
+name: Build OrangeFox hero2lte (A-Z + AI auto-fix v6)
 
 on:
   workflow_dispatch:
@@ -52,30 +52,66 @@ jobs:
           sudo swapon /swapfile
           free -h
 
-      - name: Build builder image
+      - name: Build builder image (Debian 11)
         run: |
           cat > /tmp/Dockerfile <<'DOCKEREOF'
-          FROM ubuntu:20.04
+          FROM debian:bullseye
           ENV DEBIAN_FRONTEND=noninteractive LC_ALL=C
-          RUN sed -i -e 's|http://archive.ubuntu.com|http://old-releases.ubuntu.com|g' \
-                     -e 's|http://security.ubuntu.com|http://old-releases.ubuntu.com|g' \
-                     /etc/apt/sources.list \
-           && grep -q old-releases /etc/apt/sources.list
-          RUN apt-get update -y -o Acquire::Retries=5 -o Acquire::ForceIPv4=true 2>&1 | tail -20
-          RUN set -x; for grp in "ca-certificates" "git" "curl" "zip unzip" \
-                "build-essential make" "flex bison gperf" "python3" "ccache" \
-                "rsync procps file" "libssl-dev" "openjdk-11-jdk" "zlib1g-dev" \
-                "gcc-multilib g++-multilib libc6-dev-i386" \
-                "lib32ncurses5-dev lib32z1-dev" "lzop libxml2-utils xsltproc fontconfig" \
-                "libgl1-mesa-dev libx11-dev" "x11proto-core-dev"; do \
-              echo ">>> $grp"; \
-              apt-get install -y --no-install-recommends -o Acquire::Retries=5 $grp 2>&1 | tail -3 \
-                || echo ">>> WARN group failed: $grp"; \
-            done
-          RUN set -e; for t in git curl gcc make ccache python3 zip unzip java; do \
-              command -v $t >/dev/null || { echo "MISSING $t"; exit 1; }; done
+          SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+          # multilib cho Android (32-bit)
+          RUN dpkg --add-architecture i386
+
+          # apt update — KHÔNG pipe qua tail, để exit code thật lộ ra
+          RUN apt-get update -y
+
+          # Xác nhận package list có dữ liệu thật
+          RUN apt-cache policy git gcc make curl python3 2>/dev/null | grep -E 'Candidate|Installed' | head -10 \
+              || (echo "!!! APT LISTS EMPTY" && exit 1)
+
+          # Cài theo nhóm nhỏ, mỗi nhóm fail không giết cả list
+          RUN set -x; ok=1; \
+              for grp in \
+                  "ca-certificates" \
+                  "git" \
+                  "curl wget" \
+                  "zip unzip tar xxd" \
+                  "build-essential make" \
+                  "flex bison gperf" \
+                  "python3 python-is-python3" \
+                  "ccache rsync procps file" \
+                  "libssl-dev" \
+                  "openjdk-11-jdk-headless" \
+                  "zlib1g-dev" \
+                  "gcc-multilib g++-multilib libc6-dev-i386" \
+                  "libncurses-dev lib32ncurses-dev" \
+                  "lib32z1-dev lib32readline-dev" \
+                  "lzop libxml2-utils xsltproc fontconfig" \
+                  "libgl1-mesa-dev libx11-dev" \
+              ; do \
+                  echo "════ group: $grp"; \
+                  if apt-get install -y --no-install-recommends -o Acquire::Retries=5 $grp 2>&1 | tail -8; then \
+                      echo "OK group: $grp"; \
+                  else \
+                      echo "WARN group failed (skipping): $grp"; ok=0; \
+                  fi; \
+              done; \
+              echo "=== install done (ok=$ok) ==="
+
+          # Hard requirement — phải có đủ thì mới build được
+          RUN for t in git curl gcc g++ make ccache python3 zip unzip java; do \
+                  command -v $t >/dev/null || { echo "MISSING: $t"; exit 1; }; \
+                  echo "OK $t -> $(command -v $t)"; \
+              done
+
+          # python3 -> python symlink nếu cần (repo tool dùng python)
+          RUN [ -e /usr/local/bin/python ] || ln -sf /usr/bin/python3 /usr/local/bin/python; python --version
+
           WORKDIR /workspace
           DOCKEREOF
+
+          cat /tmp/Dockerfile
+          echo "═══ docker build (apt errors sẽ hiện ngay) ═══"
           docker build --progress=plain -t foxbuilder:hero2lte /tmp/
 
       - name: Build loop with AI auto-fix
@@ -85,9 +121,7 @@ jobs:
           set +e
           mkdir -p "$WORKDIR/artifacts"
 
-          # ============================================================
-          # Container build script
-          # ============================================================
+          # ===================== container build script =====================
           cat > /tmp/of_build.sh <<'BUILDEOF'
           #!/bin/bash
           set +e
@@ -103,13 +137,13 @@ jobs:
           : > "$LOG"
           log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOG" >&2; }
 
-          # Áp dụng AI fix từ attempt trước (nếu có)
+          # Load AI fix từ attempt trước (nếu có) — chạy TRƯỚC mọi bước
           if [ -f "$AI_FIX" ]; then
               log ">>> Sourcing AI fix from previous attempt:"
               tee -a "$LOG" < "$AI_FIX" >&2
               # shellcheck disable=SC1090
               source "$AI_FIX" 2>&1 | tee -a "$LOG" >&2
-              log ">>> AI fix sourced (exit=$?)"
+              log ">>> AI fix sourced"
           fi
 
           retry_step() {
@@ -124,8 +158,7 @@ jobs:
               rc=${PIPESTATUS[0]}
               if [ "$rc" -eq 0 ]; then log "[OK] $name (retry)"; return 0; fi
               log "[FAIL] $name rc=$rc -> CONTINUE"
-              FAILED+=("$name")
-              return 0
+              FAILED+=("$name"); return 0
           }
 
           s00_env() {
@@ -148,20 +181,29 @@ jobs:
               repo --version
           }
 
+          # Sync: thử repo init trực tiếp trước, fallback về orangefox_sync.sh
           s03_sync_fox() {
               export PATH="/root/.bin:$PATH"
               cd "$WORKDIR" || return 1
+
               if [ ! -d "$FOX_PATH/.repo" ]; then
                   mkdir -p "$FOX_PATH"
                   cd "$FOX_PATH" || return 1
-                  echo ">>> repo init..."
+                  echo ">>> [try1] repo init direct..."
                   set -x
                   repo init --depth=1 -u https://gitlab.com/OrangeFox/Manifest.git -b fox_11.0 2>&1
                   local rc=$?
                   set +x
-                  [ $rc -eq 0 ] || { echo "!!! repo init failed rc=$rc"; return 1; }
-                  echo ">>> repo sync..."
-                  repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags --current-branch 2>&1
+                  if [ $rc -eq 0 ]; then
+                      echo ">>> repo init OK — repo sync..."
+                      repo sync -j"$JOBS" --force-sync --no-clone-bundle --no-tags 2>&1
+                      return $?
+                  fi
+                  echo ">>> [try1] repo init failed rc=$rc — fallback orangefox_sync.sh"
+                  cd "$WORKDIR" || return 1
+                  rm -rf "$FOX_PATH" "$WORKDIR/sync"
+                  git clone https://gitlab.com/OrangeFox/sync.git -b fox_11.0 --depth=1 "$WORKDIR/sync" || return 1
+                  ( cd "$WORKDIR/sync" && ./orangefox_sync.sh --branch "$FOX_BRANCH" --path "$FOX_PATH" )
                   return $?
               else
                   cd "$FOX_PATH" || return 1
@@ -199,7 +241,7 @@ jobs:
 
           s06_build() {
               cd "$FOX_PATH" || return 1
-              [ -f build/envsetup.sh ] || { echo "!!! No build/envsetup.sh (sync chưa hoàn tất)"; return 1; }
+              [ -f build/envsetup.sh ] || { echo "!!! No build/envsetup.sh (sync chưa xong)"; return 1; }
               export ALLOW_MISSING_DEPENDENCIES=true USE_CCACHE=1
               export CCACHE_DIR="/root/.ccache" CCACHE_COMPRESS=1 CCACHE_MAXSIZE="$CCACHE_MAX"
               source build/envsetup.sh || return 1
@@ -246,9 +288,7 @@ jobs:
               printf 'ui_print("OrangeFox recovery flash");\n' > _pkg/META-INF/com/google/android/updater-script
               rm -f "$ZIP_NAME"
               ( cd _pkg && zip -r "../$ZIP_NAME" . >/dev/null )
-              local rc=$?
-              rm -rf _pkg
-              return $rc
+              local rc=$?; rm -rf _pkg; return $rc
           }
 
           retry_step "00_env"        s00_env
@@ -262,11 +302,8 @@ jobs:
           retry_step "08_package"    s08_package
 
           log "════════ SUMMARY ════════"
-          if [ "${#FAILED[@]}" -eq 0 ]; then
-              log "All steps OK"
-          else
-              for s in "${FAILED[@]}"; do log "  - $s"; done
-          fi
+          if [ "${#FAILED[@]}" -eq 0 ]; then log "All steps OK"
+          else for s in "${FAILED[@]}"; do log "  - $s"; done; fi
           if [ -f "$ART_DIR/$ZIP_NAME" ]; then
               log "ARTIFACT OK: $ART_DIR/$ZIP_NAME"
               touch "$SENTINEL"
@@ -276,76 +313,56 @@ jobs:
           BUILDEOF
 
           chmod +x /tmp/of_build.sh
-          bash -n /tmp/of_build.sh || { echo "SYNTAX ERROR in build script"; exit 1; }
+          bash -n /tmp/of_build.sh || { echo "SYNTAX ERROR"; exit 1; }
 
-          # ============================================================
-          # AI system prompt — heredoc, MỌI dòng ở đúng 10 spaces
-          # ============================================================
+          # ===================== AI system prompt (heredoc, 10-space indent) =====================
           cat > /tmp/ai_system_raw.txt <<'SYSEOF'
           You are an expert at fixing Android OrangeFox/TWRP build failures.
           Output ONLY a bash script (no markdown fences, no explanation).
-          The script runs inside ubuntu:20.04 as root, with git, curl, repo at /root/.bin/repo.
+          The script runs inside debian:bullseye as root, inside container that has git, curl, repo at /root/.bin/repo.
+          Context: AOSP 11.0 build for Samsung hero2lte (Galaxy S7 edge).
           Constraints:
           - Whitelisted commands ONLY: apt-get git curl wget repo mkdir rm cp mv ln chmod export source cd echo sed tee tar unzip zip find grep awk head tail cat true false if then else elif fi for do done while case esac
           - Max 40 lines.
           - If you cannot determine a fix, output one line: # NO FIX
-          - NEVER use: eval, sh -c, bash -c, base64, xargs, pipe into sh/bash, wget -O -, curl -o - piped anywhere, su, sudo, systemctl, mount, umount, dd, chown.
-          - Common fixes:
+          - NEVER use: eval, sh -c, bash -c, base64, xargs, pipe into sh/bash, wget -O -, curl -o - piped, su, sudo, systemctl, mount, umount, dd, chown.
+          - Common real fixes you should consider:
             * repo: command not found -> export PATH=/root/.bin:$PATH
-            * git SSL verify fails -> git config --global http.sslVerify false
-            * repo init manifest URL 404 -> echo "manifest URL broken, check OrangeFox gitlab" and exit 0
-            * out of disk -> apt-get clean; rm -rf /tmp/*; rm -rf /root/.cache
             * missing build/envsetup.sh -> cd /workspace/foxbuild/11.0 && repo sync -j1 --force-sync
-            * device tree missing deps -> note in echo which DEP_* envs to set
+            * out of disk -> apt-get clean; rm -rf /tmp/*; rm -rf /root/.cache
+            * device tree missing deps -> echo "set DEP_HERO_COMMON_URL / DEP_UNIVERSAL8890_URL / DEP_HW_SAMSUNG_URL"
+            * lunch target unknown -> echo "try fox_hero2lte-eng or omni_hero2lte-eng"
+            * git LFS pointer files -> git lfs install; git lfs pull (only if git-lfs is present)
           SYSEOF
           sed -e 's/^          //' -e '/^$/d' /tmp/ai_system_raw.txt > /tmp/ai_system.txt
-          echo "─── AI system prompt (first 20 lines) ───"
-          head -20 /tmp/ai_system.txt
 
-          # ============================================================
-          # AI helper
-          # ============================================================
           ai_fix() {
               local log_file="$WORKDIR/build.log"
-              [ -f "$log_file" ] || { echo "No log"; return 1; }
+              [ -f "$log_file" ] || return 1
               tail -n 3000 "$log_file" | head -c 100000 > /tmp/log_snip.txt
-              echo "Log snippet: $(wc -c < /tmp/log_snip.txt) bytes"
-
-              jq -n \
-                  --rawfile sys /tmp/ai_system.txt \
-                  --rawfile log /tmp/log_snip.txt \
-                  '{
-                      model: "gpt-4o-mini",
-                      messages: [
-                          {role:"system", content:$sys},
-                          {role:"user", content:("BUILD LOG:\n" + $log + "\n\nFix script:")}
-                      ],
-                      max_tokens: 1500,
-                      temperature: 0.1
-                  }' > /tmp/ai_req.json
-
-              echo "Request size: $(wc -c < /tmp/ai_req.json) bytes"
+              jq -n --rawfile sys /tmp/ai_system.txt --rawfile log /tmp/log_snip.txt '{
+                  model: "gpt-4o-mini",
+                  messages: [
+                      {role:"system", content:$sys},
+                      {role:"user", content:("BUILD LOG:\n" + $log + "\n\nFix script:")}
+                  ],
+                  max_tokens: 1500, temperature: 0.1
+              }' > /tmp/ai_req.json
               local resp
               resp=$(curl -sS -X POST "$AI_ENDPOINT" \
                   -H "Authorization: Bearer $GITHUB_TOKEN" \
                   -H "Content-Type: application/json" \
                   -d @/tmp/ai_req.json 2>&1)
               echo "$resp" > /tmp/ai_resp.json
-
               local content
               content=$(jq -r '.choices[0].message.content // empty' /tmp/ai_resp.json 2>/dev/null)
               if [ -z "$content" ]; then
-                  echo "AI call failed or empty response:"
-                  head -c 500 /tmp/ai_resp.json
-                  echo
-                  return 1
+                  echo "AI call failed:"; head -c 400 /tmp/ai_resp.json; echo; return 1
               fi
-
               printf '%s\n' "$content" | sed -e 's/^```[a-zA-Z]*$//' -e 's/^```$//' > /tmp/ai_fix.sh
               echo "─── AI suggested fix ───"
               cat /tmp/ai_fix.sh
               echo "────────────────────────"
-
               local bad=0 line_no=0 line trimmed
               while IFS= read -r line; do
                   line_no=$((line_no + 1))
@@ -357,25 +374,17 @@ jobs:
                       if\ *|then|else|elif\ *|fi|for\ *|do|done|while\ *|case\ *|esac) continue ;;
                       apt-get*|git*|curl*|wget*|repo*|mkdir*|rm*|cp*|mv*|ln*|chmod*|export*|source*|cd*|echo*|sed*|tee*|tar*|unzip*|zip*|find*|grep*|awk*|head*|tail*|cat*|true|false) continue ;;
                   esac
-                  echo "✗ Line $line_no not whitelisted: $trimmed"
-                  bad=1
+                  echo "✗ Line $line_no not whitelisted: $trimmed"; bad=1
               done < /tmp/ai_fix.sh
-
               if [ $bad -ne 0 ]; then echo "✗ AI fix rejected"; return 1; fi
               if grep -qxF '# NO FIX' /tmp/ai_fix.sh; then echo "AI: NO FIX"; return 1; fi
               bash -n /tmp/ai_fix.sh || { echo "✗ AI script syntax error"; return 1; }
-              echo "✓ AI fix validated"
-              return 0
+              echo "✓ AI fix validated"; return 0
           }
 
-          # ============================================================
-          # MAIN LOOP
-          # ============================================================
+          # ===================== MAIN LOOP =====================
           for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-              echo "═══════════════════════════════════════════"
-              echo "  ATTEMPT $attempt / $MAX_ATTEMPTS"
-              echo "═══════════════════════════════════════════"
-
+              echo "════════ ATTEMPT $attempt / $MAX_ATTEMPTS ════════"
               rm -f "$WORKDIR/.build_done"
               : > "$WORKDIR/build.log"
 
@@ -402,25 +411,18 @@ jobs:
                   echo "✓ BUILD SUCCESS on attempt $attempt"
                   exit 0
               fi
-
-              if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then
-                  echo "✗ All $MAX_ATTEMPTS attempts failed"
-                  break
-              fi
+              if [ "$attempt" -ge "$MAX_ATTEMPTS" ]; then break; fi
 
               echo "─── Asking AI to diagnose + fix ───"
               if ai_fix; then
-                  # Lưu fix để attempt sau source (persistence)
                   cp /tmp/ai_fix.sh "$WORKDIR/.ai_fix.sh"
-                  echo "─── AI fix saved → sẽ được source ở attempt $((attempt+1)) ───"
+                  echo "─── AI fix saved for attempt $((attempt+1)) ───"
               else
                   echo "AI không đề xuất fix an toàn → attempt sau chạy lại y nguyên"
               fi
-              echo "─── Retrying in 5s ───"
               sleep 5
           done
 
-          echo "════════ FINAL ARTIFACT CHECK ════════"
           ls -la "$WORKDIR/artifacts" || true
           [ -f "$WORKDIR/artifacts/$ZIP_NAME" ] && exit 0 || exit 1
 
