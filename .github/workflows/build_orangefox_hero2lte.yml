@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: "1: Setup swap"
+      - name: "1: Setup + swap"
         run: |
           set -x
           sudo swapoff /swapfile 2>/dev/null || true
@@ -23,70 +23,118 @@ jobs:
           sudo mkswap /swapfile
           sudo swapon /swapfile
           free -h
-          df -h /
-          mkdir -p "${{ github.workspace }}/fox" "${{ github.workspace }}/out"
+          mkdir -p "${{ github.workspace }}/probe"
+          mkdir -p "${{ github.workspace }}/fox"
+          mkdir -p "${{ github.workspace }}/out"
 
-      - name: "2: Check what's pre-installed"
+      - name: "2: Probe manifest URLs and branches (ALWAYS produces file)"
         run: |
-          set -x
-          for t in git curl wget python3 gcc g++ make file zip unzip tar xxd java ccache flex bison gperf rsync lzop xsltproc; do
-            command -v "$t" && "$t" --version 2>&1 | head -1 || echo "MISSING: $t"
+          set +e
+          PROBE="${{ github.workspace }}/probe/manifests.txt"
+          : > "$PROBE"
+          export GIT_TERMINAL_PROMPT=0
+          for url in \
+            "https://gitlab.com/OrangeFox/Manifest.git" \
+            "https://gitlab.com/OrangeFox/Manifest" \
+            "https://github.com/OrangeFoxRecovery/platform_manifest.git" \
+            "https://github.com/OrangeFoxRecovery/manifest.git" \
+            "https://github.com/OrangeFoxRecovery/Manifest.git" \
+            "https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git" \
+          ; do
+            echo "════════════════════════════════════════" >> "$PROBE"
+            echo "URL: $url" >> "$PROBE"
+            echo "════════════════════════════════════════" >> "$PROBE"
+            OUT=$(timeout 25 git ls-remote --heads "$url" 2>&1)
+            RC=$?
+            if [ "$RC" -eq 0 ] && [ -n "$OUT" ]; then
+              echo "✓ REACHABLE. Branches:" >> "$PROBE"
+              echo "$OUT" | awk '{print "   " $2}' | sed 's|refs/heads/||' >> "$PROBE"
+            else
+              echo "✗ FAILED rc=$RC" >> "$PROBE"
+              echo "$OUT" | head -20 >> "$PROBE"
+            fi
           done
-          echo "--- Java homes ---"
-          ls /usr/lib/jvm/ 2>/dev/null || true
-          echo "JAVA_HOME_11_X64=$JAVA_HOME_11_X64"
+          echo "─── probe contents ───"
+          cat "$PROBE"
 
-      - name: "3: apt update (timeout 4 min)"
-        timeout-minutes: 5
+      - name: "3: Upload probe immediately (guaranteed artifact)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-results
+          path: ${{ github.workspace }}/probe/manifests.txt
+          if-no-files-found: error
+
+      - name: "4: Install apt packages"
         run: |
           set -x
           sudo rm -rf /var/lib/apt/lists/*
           sudo timeout 240 apt-get update \
-            -o Acquire::http::Timeout=20 \
-            -o Acquire::https::Timeout=20 \
-            -o Acquire::Retries=2 \
-            -o Acquire::ForceIPv4=true
-          echo "update rc=$?"
-
-      - name: "4: apt install (only MISSING packages, timeout 15 min)"
-        timeout-minutes: 20
-        run: |
-          set -x
-          # Chỉ cài những gì runner Ubuntu latest thường thiếu cho AOSP recovery
-          sudo DEBIAN_FRONTEND=noninteractive timeout 900 apt-get install -y --no-install-recommends \
-            -o Acquire::http::Timeout=20 \
-            -o Acquire::https::Timeout=20 \
-            -o Acquire::Retries=2 \
-            ccache flex bison gperf \
-            libssl-dev zlib1g-dev lzop libxml2-utils xsltproc \
-            python-is-python3 \
+            -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 \
+            -o Acquire::Retries=2 -o Acquire::ForceIPv4=true || echo "update slow"
+          sudo DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y --no-install-recommends \
+            -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 \
+            ccache flex bison gperf libssl-dev zlib1g-dev lzop \
+            libxml2-utils xsltproc python-is-python3 \
             libc6-dev-i386 lib32ncurses-dev lib32readline-dev lib32z1-dev \
-            || echo "INSTALL PARTIAL (continuing anyway)"
-          echo "install rc=$?"
-          echo "--- verify ---"
-          for t in ccache flex bison gperf xsltproc python3; do
+            || echo "install partial"
+          for t in ccache flex bison gperf python3; do
             command -v "$t" || echo "MISSING $t"
           done
 
-      - name: "5: Install repo tool"
+      - name: "5: Install repo + choose manifest branch from probe"
         run: |
           set -x
           mkdir -p "$HOME/.bin"
           curl -fsSL --max-time 60 https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.bin/repo"
           chmod +x "$HOME/.bin/repo"
           echo "$HOME/.bin" >> "$GITHUB_PATH"
-          "$HOME/.bin/repo" --version
+          export PATH="$HOME/.bin:$PATH"
+
+          PROBE="${{ github.workspace }}/probe/manifests.txt"
+          # Chọn URL đầu tiên reachable
+          MANIFEST_URL=""
+          MANIFEST_BRANCH=""
+          URLS=(
+            "https://gitlab.com/OrangeFox/Manifest.git"
+            "https://github.com/OrangeFoxRecovery/platform_manifest.git"
+            "https://github.com/OrangeFoxRecovery/manifest.git"
+            "https://github.com/OrangeFoxRecovery/Manifest.git"
+            "https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git"
+          )
+          for u in "${URLS[@]}"; do
+            BRANCHES=$(timeout 25 git ls-remote --heads "$u" 2>/dev/null | awk -F/ '{print $NF}')
+            [ -z "$BRANCHES" ] && continue
+            echo "URL $u branches: $BRANCHES"
+            # Ưu tiên branch chứa "11" (Android 11)
+            CANDIDATE=$(echo "$BRANCHES" | grep -E '11' | head -1)
+            [ -z "$CANDIDATE" ] && CANDIDATE=$(echo "$BRANCHES" | head -1)
+            if [ -n "$CANDIDATE" ]; then
+              MANIFEST_URL="$u"
+              MANIFEST_BRANCH="$CANDIDATE"
+              echo "✓ CHOSEN: $u  branch=$CANDIDATE"
+              break
+            fi
+          done
+
+          if [ -z "$MANIFEST_URL" ]; then
+            echo "!!! NO REACHABLE MANIFEST — dừng." | tee "${{ github.workspace }}/probe/no_manifest.txt"
+            exit 1
+          fi
+          echo "MANIFEST_URL=$MANIFEST_URL" >> "$GITHUB_ENV"
+          echo "MANIFEST_BRANCH=$MANIFEST_BRANCH" >> "$GITHUB_ENV"
+          echo "Chosen $MANIFEST_URL / $MANIFEST_BRANCH" > "${{ github.workspace }}/probe/chosen.txt"
 
       - name: "6: Repo init + sync"
         working-directory: ${{ github.workspace }}/fox
         run: |
           set -x
           export PATH="$HOME/.bin:$PATH"
-          repo init -u https://gitlab.com/OrangeFox/Manifest.git -b fox_11.0
-          echo "--- manifest list ---"
-          ls -la .repo/manifests/ 2>/dev/null || true
-          echo "--- syncing (this takes 30-60 min) ---"
-          repo sync -j4 --no-clone-bundle --no-tags
+          echo "INIT: $MANIFEST_URL / $MANIFEST_BRANCH"
+          repo init --depth=1 -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH" 2>&1 | tee init.log
+          echo "--- manifest head ---"
+          head -100 .repo/manifests/*.xml 2>/dev/null || ls .repo/manifests/ 2>/dev/null
+          echo "--- sync (30-60 min) ---"
+          repo sync -j4 --no-clone-bundle --no-tags 2>&1 | tee sync.log
           ls -la
 
       - name: "7: Clone device tree + deps"
@@ -94,72 +142,89 @@ jobs:
         run: |
           set -x
           mkdir -p device/samsung kernel/samsung hardware
-
           DT_OK=0
           for b in fox_11.0 fox_9.0 main; do
-            echo "=== try device tree branch: $b ==="
+            echo "=== DT branch: $b ==="
             rm -rf device/samsung/hero2lte
             if git clone --depth=1 -b "$b" \
                 https://github.com/OrangeFoxRecovery/device_samsung_hero2lte.git \
-                device/samsung/hero2lte; then
-              echo "=== OK branch=$b ==="
-              DT_OK=1; break
+                device/samsung/hero2lte 2>&1; then
+              DT_OK=1; echo "DT OK=$b"; break
             fi
           done
-          [ "$DT_OK" = "1" ] || { echo "!!! ALL DT BRANCHES FAILED"; exit 1; }
-
-          git clone --depth=1 -b lineage-18.1 \
-            https://github.com/LineageOS/android_device_samsung_hero-common.git \
-            device/samsung/hero-common || echo "hero-common skip"
-          git clone --depth=1 -b lineage-18.1 \
-            https://github.com/LineageOS/android_kernel_samsung_universal8890.git \
-            kernel/samsung/universal8890 || echo "kernel skip"
-          git clone --depth=1 -b lineage-18.1 \
-            https://github.com/LineageOS/android_hardware_samsung.git \
-            hardware/samsung || echo "hardware skip"
+          [ "$DT_OK" = "1" ] || { echo "!!! ALL DT FAILED"; exit 1; }
+          # Deps từ LineageOS 18.1 (Android 11)
+          for r in \
+            "android_device_samsung_hero-common|device/samsung/hero-common" \
+            "android_kernel_samsung_universal8890|kernel/samsung/universal8890" \
+            "android_hardware_samsung|hardware/samsung" \
+          ; do
+            name="${r%%|*}"; path="${r##*|}"
+            [ -d "$path" ] || git clone --depth=1 -b lineage-18.1 \
+                "https://github.com/LineageOS/${name}.git" "$path" || echo "skip $name"
+          done
+          ls -la device/samsung/
 
       - name: "8: Build recovery"
         working-directory: ${{ github.workspace }}/fox
         run: |
           set -x
-          export ALLOW_MISSING_DEPENDENCIES=true
-          export LC_ALL=C
-          export USE_CCACHE=1
-          export CCACHE_DIR="$HOME/.ccache"
-          export CCACHE_COMPRESS=1
-          export CCACHE_MAXSIZE=20G
+          export ALLOW_MISSING_DEPENDENCIES=true LC_ALL=C
+          export USE_CCACHE=1 CCACHE_DIR="$HOME/.ccache" CCACHE_COMPRESS=1 CCACHE_MAXSIZE=20G
           mkdir -p "$CCACHE_DIR"
           ccache -M 20G; ccache -z
-          # Chọn Java 11 (AOSP 11 cần Java 11)
-          if [ -d "$JAVA_HOME_11_X64" ]; then
-            export JAVA_HOME="$JAVA_HOME_11_X64"
-          elif [ -d /usr/lib/jvm/java-11-openjdk-amd64 ]; then
-            export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
-          fi
-          export PATH="$JAVA_HOME/bin:$PATH"
-          java -version
+          if [ -n "${JAVA_HOME_11_X64:-}" ]; then export JAVA_HOME="$JAVA_HOME_11_X64"; fi
+          [ -n "$JAVA_HOME" ] && export PATH="$JAVA_HOME/bin:$PATH"
+          java -version || true
+          [ -f build/envsetup.sh ] || { echo "NO envsetup.sh"; exit 1; }
           source build/envsetup.sh
-          lunch omni_hero2lte-eng \
-            || lunch fox_hero2lte-eng \
-            || lunch lineage_hero2lte-eng \
-            || { echo "NO LUNCH TARGET"; exit 1; }
-          mka recoveryimage -j4
+          lunch omni_hero2lte-eng || lunch fox_hero2lte-eng || lunch lineage_hero2lte-eng || { echo "NO LUNCH"; exit 1; }
+          mka recoveryimage -j4 2>&1 | tee build.log
 
-      - name: "9: Verify + package + upload"
+      - name: "9: Collect + package + ALWAYS write diagnostics"
         if: always()
         run: |
-          set -x
+          set +e
           WD="${{ github.workspace }}"
           OUT="$WD/fox/out/target/product/hero2lte"
           DEST="$WD/out"
+
+          # 9a. Luôn ghi diagnostics
+          {
+            echo "===== DIAGNOSTICS $(date -u) ====="
+            echo "MANIFEST_URL=$MANIFEST_URL"
+            echo "MANIFEST_BRANCH=$MANIFEST_BRANCH"
+            echo "---- uname ----"; uname -a
+            echo "---- tools ----"
+            for t in git gcc g++ make python3 ccache flex bison gperf java xsltproc lzop; do
+              command -v "$t" && "$t" --version 2>&1 | head -1
+            done
+            echo "---- disk ----"; df -h /
+            echo "---- out dir ----"
+            [ -d "$OUT" ] && ls -la "$OUT" || echo "OUT MISSING: $OUT"
+            echo "---- out/ parent ----"
+            [ -d "$WD/fox/out" ] && ls -laR "$WD/fox/out" | head -100 || echo "no fox/out"
+            echo "---- build.log tail (last 300 lines) ----"
+            [ -f "$WD/fox/build.log" ] && tail -n 300 "$WD/fox/build.log" || echo "no build.log"
+            echo "---- init.log tail ----"
+            [ -f "$WD/fox/init.log" ] && tail -n 100 "$WD/fox/init.log"
+            echo "---- sync.log tail ----"
+            [ -f "$WD/fox/sync.log" ] && tail -n 100 "$WD/fox/sync.log"
+          } > "$WD/diagnostics.txt"
+          echo "diagnostics.txt size: $(wc -c < "$WD/diagnostics.txt") bytes"
+
+          # 9b. Gom output nếu có
           mkdir -p "$DEST"
           if [ -d "$OUT" ]; then
-            ls -la "$OUT"
-            cp -v "$OUT/recovery.img" "$DEST/" 2>/dev/null || true
-            cp -v "$OUT"/OrangeFox*.zip "$DEST/" 2>/dev/null || true
-          else
-            echo "!!! OUT DIR MISSING: $OUT"
+            cp -v "$OUT/recovery.img" "$DEST/" 2>/dev/null
+            cp -v "$OUT"/OrangeFox*.zip "$DEST/" 2>/dev/null
           fi
+          # Copy log vào out/
+          cp -v "$WD/fox/build.log" "$DEST/" 2>/dev/null
+          cp -v "$WD/fox/init.log" "$DEST/" 2>/dev/null
+          cp -v "$WD/fox/sync.log" "$DEST/" 2>/dev/null
+
+          # 9c. Đóng gói recovery.img nếu có
           cd "$DEST"
           if [ -f recovery.img ] && [ ! -f OrangeFox-hero2lte-TWRP.zip ]; then
             mkdir -p _pkg/META-INF/com/google/android
@@ -186,10 +251,12 @@ jobs:
           fi
           ls -la "$DEST"
 
-      - name: "10: Upload artifact"
+      - name: "10: Upload everything (build output + logs + diagnostics)"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: OrangeFox-hero2lte-output
-          path: ${{ github.workspace }}/out/
-          if-no-files-found: warn
+          name: build-output-and-logs
+          path: |
+            ${{ github.workspace }}/out/
+            ${{ github.workspace }}/diagnostics.txt
+          if-no-files-found: error
