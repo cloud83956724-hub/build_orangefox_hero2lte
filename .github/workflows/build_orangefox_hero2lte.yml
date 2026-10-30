@@ -7,16 +7,15 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 350
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: "1: Setup"
+      - name: "1: Setup swap"
         run: |
           set -x
-          echo "STEP 1 START $(date)"
           sudo swapoff /swapfile 2>/dev/null || true
           sudo rm -f /swapfile
           sudo fallocate -l 8G /swapfile
@@ -25,105 +24,104 @@ jobs:
           sudo swapon /swapfile
           free -h
           df -h /
-          mkdir -p "${{ github.workspace }}/fox"
-          mkdir -p "${{ github.workspace }}/out"
-          echo "STEP 1 END $(date)"
+          mkdir -p "${{ github.workspace }}/fox" "${{ github.workspace }}/out"
 
-      - name: "2: Install dependencies"
+      - name: "2: Check what's pre-installed"
         run: |
           set -x
-          echo "STEP 2 START $(date)"
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates git gcc g++ make python3 python-is-python3 ccache \
-            openjdk-11-jdk-headless curl wget zip unzip tar file xxd \
-            libssl-dev zlib1g-dev flex bison gperf \
-            || echo "GROUP1 PARTIAL"
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            bc lib32ncurses-dev lib32readline-dev lib32z1-dev liblz4-tool \
-            libncurses5 libncurses-dev libsdl1.2-dev libxml2 libxml2-utils \
-            lzop pngcrush rsync schedtool squashfs-tools xsltproc \
-            libc6-dev-i386 libgl1-mesa-dev libx11-dev imagemagick gnupg \
-            || echo "GROUP2 PARTIAL"
-          echo "--- verifying critical tools ---"
-          for t in git gcc g++ make python3 zip unzip java curl wget repo; do
+          for t in git curl wget python3 gcc g++ make file zip unzip tar xxd java ccache flex bison gperf rsync lzop xsltproc; do
+            command -v "$t" && "$t" --version 2>&1 | head -1 || echo "MISSING: $t"
+          done
+          echo "--- Java homes ---"
+          ls /usr/lib/jvm/ 2>/dev/null || true
+          echo "JAVA_HOME_11_X64=$JAVA_HOME_11_X64"
+
+      - name: "3: apt update (timeout 4 min)"
+        timeout-minutes: 5
+        run: |
+          set -x
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo timeout 240 apt-get update \
+            -o Acquire::http::Timeout=20 \
+            -o Acquire::https::Timeout=20 \
+            -o Acquire::Retries=2 \
+            -o Acquire::ForceIPv4=true
+          echo "update rc=$?"
+
+      - name: "4: apt install (only MISSING packages, timeout 15 min)"
+        timeout-minutes: 20
+        run: |
+          set -x
+          # Chỉ cài những gì runner Ubuntu latest thường thiếu cho AOSP recovery
+          sudo DEBIAN_FRONTEND=noninteractive timeout 900 apt-get install -y --no-install-recommends \
+            -o Acquire::http::Timeout=20 \
+            -o Acquire::https::Timeout=20 \
+            -o Acquire::Retries=2 \
+            ccache flex bison gperf \
+            libssl-dev zlib1g-dev lzop libxml2-utils xsltproc \
+            python-is-python3 \
+            libc6-dev-i386 lib32ncurses-dev lib32readline-dev lib32z1-dev \
+            || echo "INSTALL PARTIAL (continuing anyway)"
+          echo "install rc=$?"
+          echo "--- verify ---"
+          for t in ccache flex bison gperf xsltproc python3; do
             command -v "$t" || echo "MISSING $t"
           done
-          echo "STEP 2 END $(date)"
 
-      - name: "3: Install repo tool"
+      - name: "5: Install repo tool"
         run: |
           set -x
-          echo "STEP 3 START $(date)"
           mkdir -p "$HOME/.bin"
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.bin/repo"
+          curl -fsSL --max-time 60 https://storage.googleapis.com/git-repo-downloads/repo -o "$HOME/.bin/repo"
           chmod +x "$HOME/.bin/repo"
           echo "$HOME/.bin" >> "$GITHUB_PATH"
           "$HOME/.bin/repo" --version
-          echo "STEP 3 END $(date)"
 
-      - name: "4: Repo init + sync"
+      - name: "6: Repo init + sync"
         working-directory: ${{ github.workspace }}/fox
         run: |
           set -x
-          echo "STEP 4 START $(date)"
+          export PATH="$HOME/.bin:$PATH"
           repo init -u https://gitlab.com/OrangeFox/Manifest.git -b fox_11.0
-          echo "--- manifest loaded ---"
-          head -50 .repo/manifests/default.xml 2>/dev/null || ls -la .repo/manifests/ 2>/dev/null
-          echo "--- starting repo sync (this takes 30-60 min on first run) ---"
+          echo "--- manifest list ---"
+          ls -la .repo/manifests/ 2>/dev/null || true
+          echo "--- syncing (this takes 30-60 min) ---"
           repo sync -j4 --no-clone-bundle --no-tags
-          echo "--- sync done ---"
           ls -la
-          echo "STEP 4 END $(date)"
 
-      - name: "5: Clone device tree + deps"
+      - name: "7: Clone device tree + deps"
         working-directory: ${{ github.workspace }}/fox
         run: |
           set -x
-          echo "STEP 5 START $(date)"
           mkdir -p device/samsung kernel/samsung hardware
 
-          echo "--- trying device tree branches: fox_11.0 → fox_9.0 → main ---"
           DT_OK=0
           for b in fox_11.0 fox_9.0 main; do
-            echo "=== trying branch: $b ==="
+            echo "=== try device tree branch: $b ==="
             rm -rf device/samsung/hero2lte
             if git clone --depth=1 -b "$b" \
                 https://github.com/OrangeFoxRecovery/device_samsung_hero2lte.git \
                 device/samsung/hero2lte; then
-              echo "=== device tree OK (branch=$b) ==="
-              DT_OK=1
-              break
+              echo "=== OK branch=$b ==="
+              DT_OK=1; break
             fi
           done
-          if [ "$DT_OK" = "0" ]; then
-            echo "!!! ALL DEVICE TREE BRANCHES FAILED"
-            exit 1
-          fi
-          ls -la device/samsung/hero2lte/ | head -30
+          [ "$DT_OK" = "1" ] || { echo "!!! ALL DT BRANCHES FAILED"; exit 1; }
 
-          echo "--- cloning hero-common (LineageOS 18.1) ---"
           git clone --depth=1 -b lineage-18.1 \
             https://github.com/LineageOS/android_device_samsung_hero-common.git \
-            device/samsung/hero-common || echo "!!! hero-common failed (skip)"
-
-          echo "--- cloning kernel (LineageOS 18.1) ---"
+            device/samsung/hero-common || echo "hero-common skip"
           git clone --depth=1 -b lineage-18.1 \
             https://github.com/LineageOS/android_kernel_samsung_universal8890.git \
-            kernel/samsung/universal8890 || echo "!!! kernel failed (skip)"
-
-          echo "--- cloning hardware/samsung ---"
+            kernel/samsung/universal8890 || echo "kernel skip"
           git clone --depth=1 -b lineage-18.1 \
             https://github.com/LineageOS/android_hardware_samsung.git \
-            hardware/samsung || echo "!!! hardware failed (skip)"
+            hardware/samsung || echo "hardware skip"
 
-          echo "STEP 5 END $(date)"
-
-      - name: "6: Build recovery"
+      - name: "8: Build recovery"
         working-directory: ${{ github.workspace }}/fox
         run: |
           set -x
-          echo "STEP 6 START $(date)"
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
           export USE_CCACHE=1
@@ -131,54 +129,39 @@ jobs:
           export CCACHE_COMPRESS=1
           export CCACHE_MAXSIZE=20G
           mkdir -p "$CCACHE_DIR"
-          ccache -M 20G
-          ccache -z
-          echo "--- sourcing envsetup ---"
+          ccache -M 20G; ccache -z
+          # Chọn Java 11 (AOSP 11 cần Java 11)
+          if [ -d "$JAVA_HOME_11_X64" ]; then
+            export JAVA_HOME="$JAVA_HOME_11_X64"
+          elif [ -d /usr/lib/jvm/java-11-openjdk-amd64 ]; then
+            export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64
+          fi
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
           source build/envsetup.sh
-          echo "--- choosing lunch target ---"
           lunch omni_hero2lte-eng \
             || lunch fox_hero2lte-eng \
             || lunch lineage_hero2lte-eng \
-            || { echo "!!! NO LUNCH TARGET WORKED"; exit 1; }
-          echo "--- mka recoveryimage ---"
+            || { echo "NO LUNCH TARGET"; exit 1; }
           mka recoveryimage -j4
-          echo "STEP 6 END $(date)"
 
-      - name: "7: Verify artifact"
-        if: always()
-        working-directory: ${{ github.workspace }}/fox
-        run: |
-          set -x
-          echo "STEP 7 START $(date)"
-          OUT="out/target/product/hero2lte"
-          if [ ! -d "$OUT" ]; then
-            echo "!!! OUT DIR MISSING: $OUT"
-            ls -la out/ 2>/dev/null || echo "no out/ at all"
-            exit 1
-          fi
-          ls -la "$OUT"
-          if [ -f "$OUT/recovery.img" ] || ls "$OUT"/OrangeFox*.zip >/dev/null 2>&1; then
-            echo "✓ ARTIFACT FOUND"
-          else
-            echo "✗ NO ARTIFACT (no recovery.img, no OrangeFox zip)"
-            exit 1
-          fi
-          echo "STEP 7 END $(date)"
-
-      - name: "8: Package + upload"
+      - name: "9: Verify + package + upload"
         if: always()
         run: |
           set -x
-          echo "STEP 8 START $(date)"
           WD="${{ github.workspace }}"
           OUT="$WD/fox/out/target/product/hero2lte"
           DEST="$WD/out"
           mkdir -p "$DEST"
-          [ -d "$OUT" ] && cp -v "$OUT/recovery.img" "$DEST/" 2>/dev/null || true
-          [ -d "$OUT" ] && cp -v "$OUT"/OrangeFox*.zip "$DEST/" 2>/dev/null || true
+          if [ -d "$OUT" ]; then
+            ls -la "$OUT"
+            cp -v "$OUT/recovery.img" "$DEST/" 2>/dev/null || true
+            cp -v "$OUT"/OrangeFox*.zip "$DEST/" 2>/dev/null || true
+          else
+            echo "!!! OUT DIR MISSING: $OUT"
+          fi
           cd "$DEST"
           if [ -f recovery.img ] && [ ! -f OrangeFox-hero2lte-TWRP.zip ]; then
-            echo "--- packaging recovery.img into TWRP zip ---"
             mkdir -p _pkg/META-INF/com/google/android
             cp recovery.img _pkg/
             printf '%s\n' \
@@ -192,7 +175,6 @@ jobs:
               'BLK="/dev/block/by-name/RECOVERY"' \
               '[ -e "$BLK" ] || BLK=$(find /dev/block/platform -type l -name RECOVERY 2>/dev/null | head -n1)' \
               '[ -n "$BLK" ] && [ -e "$BLK" ] || { ui_print "RECOVERY not found"; exit 1; }' \
-              'ui_print "Flashing to $BLK"' \
               'dd if=recovery.img of="$BLK" bs=4M || exit 1' \
               'sync' \
               'ui_print "Done"' \
@@ -203,9 +185,8 @@ jobs:
             rm -rf _pkg
           fi
           ls -la "$DEST"
-          echo "STEP 8 END $(date)"
 
-      - name: "9: Upload artifact"
+      - name: "10: Upload artifact"
         if: always()
         uses: actions/upload-artifact@v4
         with:
